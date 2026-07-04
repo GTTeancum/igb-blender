@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+- "Auto-Detect Game Folder" replaced with **Set Game Folder…** — a validated
+  folder picker (these games are 2005/2006-era and long delisted; scanning
+  Steam/GOG paths never finds them). Picking a subfolder like maps/ walks up
+  to the game root automatically; confirms maps/actors/sounds are present.
+
 ## 0.6.0 — 2026-07-04
 
 The "maps play like the game" release.

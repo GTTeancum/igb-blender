@@ -6,9 +6,9 @@ A Blender 4.4 addon for importing and exporting Alchemy Engine IGB/IGZ files use
 
 Includes a full map maker toolkit (with **Import Full Map** — load any game map with its entities, NPCs, motion paths and audio, then edit and rebuild it), a game-accurate **Simulate** + **Game Shading** preview, an actor/skeleton/animation pipeline, a rig converter for custom characters, a full **Conversation Editor** with in-game-style preview and voice playback, and a texture editor for creating and modifying game textures.
 
-> Tip: set **Game Data Dir** once (Map Maker → Scene → Paths, or the
-> **Auto-Detect Game Folder** button) — voice playback, NPC loading,
-> conversations and scene audio all depend on it.
+> Tip: set **Game Data Dir** once (Map Maker → Scene → Paths → **Set Game
+> Folder…**, pointing at the folder that contains `maps/` and `actors/`) —
+> voice playback, NPC loading, conversations and scene audio all depend on it.
 
 Created by **Kaiko** with the aid of **Claude**.
 

@@ -687,7 +687,7 @@ class MM_PT_Scene_Paths(Panel):
         if not settings.game_data_dir:
             col.label(text="Needed for audio, NPCs, conversations",
                       icon='ERROR')
-        col.operator("mm.autodetect_game_dir", icon='VIEWZOOM')
+        col.operator("mm.pick_game_dir", icon='FILE_FOLDER')
         col.separator()
         col.prop(settings, "automap_path")
         col.label(text="Leave blank for auto: automaps/{map_path}/{map_name}", icon='INFO')

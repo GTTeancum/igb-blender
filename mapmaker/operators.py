@@ -3354,96 +3354,54 @@ class MM_OT_game_shading(Operator):
         return {'FINISHED'}
 
 
-def _find_game_installs():
-    """Scan Steam/GOG/common install paths for XML1/XML2/MUA game roots.
-
-    A game root = a directory containing maps/ + actors/ (and usually
-    XMen2.exe or Game.exe). Returns list of (label, path).
-    """
-    candidates = []
-
-    # Steam libraries from the registry
-    try:
-        import winreg
-        for hive, key in ((winreg.HKEY_CURRENT_USER, r"Software\Valve\Steam"),
-                          (winreg.HKEY_LOCAL_MACHINE,
-                           r"SOFTWARE\WOW6432Node\Valve\Steam")):
-            try:
-                with winreg.OpenKey(hive, key) as k:
-                    steam, _ = winreg.QueryValueEx(k, "SteamPath" if hive ==
-                                                   winreg.HKEY_CURRENT_USER
-                                                   else "InstallPath")
-                    candidates.append(os.path.join(steam, "steamapps",
-                                                   "common"))
-                    vdf = os.path.join(steam, "steamapps",
-                                       "libraryfolders.vdf")
-                    if os.path.isfile(vdf):
-                        import re
-                        text = open(vdf, "r", errors="replace").read()
-                        for m in re.finditer(r'"path"\s+"([^"]+)"', text):
-                            candidates.append(os.path.join(
-                                m.group(1).replace("\\\\", "\\"),
-                                "steamapps", "common"))
-            except OSError:
-                continue
-    except Exception:
-        pass
-
-    # Common fixed locations
-    for drive in "CDEFG":
-        for sub in (r"Program Files (x86)\Activision",
-                    r"Program Files\Activision",
-                    r"GOG Games", r"Games"):
-            candidates.append(f"{drive}:\\{sub}")
-
-    found = []
-    seen = set()
-    for root in candidates:
-        if not root or not os.path.isdir(root):
-            continue
-        try:
-            children = os.listdir(root)
-        except OSError:
-            continue
-        for child in children:
-            p = os.path.join(root, child)
-            key = os.path.normcase(p)
-            if key in seen or not os.path.isdir(p):
-                continue
-            seen.add(key)
-            if (os.path.isdir(os.path.join(p, "maps"))
-                    and os.path.isdir(os.path.join(p, "actors"))):
-                found.append((child, p))
-    return found
-
-
-class MM_OT_autodetect_game_dir(Operator):
-    """Scan Steam/GOG/common install folders for XML1/XML2/MUA and fill Game Data Dir"""
-    bl_idname = "mm.autodetect_game_dir"
-    bl_label = "Auto-Detect Game Folder"
+class MM_OT_pick_game_dir(Operator):
+    """Pick your game install folder — validated (maps/actors/sounds) and set as Game Data Dir"""
+    # These games are 2005/2006-era and long delisted — installs live wherever
+    # the user put them, so we ASK instead of scanning launcher folders.
+    bl_idname = "mm.pick_game_dir"
+    bl_label = "Set Game Folder…"
     bl_options = {'REGISTER', 'UNDO'}
+
+    directory: StringProperty(subtype='DIR_PATH')
+    filter_folder: BoolProperty(default=True, options={'HIDDEN'})
+
+    def invoke(self, context, event):
+        settings = context.scene.mm_settings
+        if settings.game_data_dir:
+            self.directory = bpy.path.abspath(settings.game_data_dir)
+        context.window_manager.fileselect_add(self)
+        return {'RUNNING_MODAL'}
 
     def execute(self, context):
         settings = context.scene.mm_settings
-        found = _find_game_installs()
-        if not found:
-            self.report({'WARNING'},
-                        "No game install found (looked in Steam libraries, "
-                        "Activision/GOG folders). Set Game Data Dir manually.")
+        root = os.path.abspath(self.directory)
+        if not os.path.isdir(root):
+            self.report({'ERROR'}, f"Not a folder: {root}")
             return {'CANCELLED'}
-        # Prefer MUA > XML2 > first (MUA unlocks the most features)
-        def rank(item):
-            n = item[0].lower()
-            if "ultimate alliance" in n or "mua" in n:
-                return 0
-            if "legends ii" in n or "legends 2" in n or "xml2" in n:
-                return 1
-            return 2
-        found.sort(key=rank)
-        settings.game_data_dir = found[0][1]
-        extra = f" (+{len(found)-1} more found)" if len(found) > 1 else ""
-        self.report({'INFO'},
-                    f"Game Data Dir → {found[0][1]}{extra}")
+
+        # If they picked a subfolder (maps/, actors/…), walk up to the root.
+        probe = root
+        for _ in range(3):
+            if (os.path.isdir(os.path.join(probe, "maps"))
+                    and os.path.isdir(os.path.join(probe, "actors"))):
+                root = probe
+                break
+            probe = os.path.dirname(probe)
+
+        parts = {name: os.path.isdir(os.path.join(root, name))
+                 for name in ("maps", "actors", "sounds", "models",
+                              "conversations")}
+        settings.game_data_dir = root
+        found = [k for k, v in parts.items() if v]
+        missing = [k for k, v in parts.items() if not v]
+        if not parts["maps"] or not parts["actors"]:
+            self.report({'WARNING'},
+                        f"Game Data Dir set, but this doesn't look like a "
+                        f"game root (missing: {', '.join(missing)}). "
+                        f"Pick the folder that contains maps/ and actors/")
+        else:
+            msg = f"Game Data Dir → {root} ({', '.join(found)} ✓)"
+            self.report({'INFO'}, msg)
         return {'FINISHED'}
 
 
@@ -5697,7 +5655,7 @@ _classes = (
     MM_OT_simulate_play,
     MM_OT_simulate_stop,
     MM_OT_game_shading,
-    MM_OT_autodetect_game_dir,
+    MM_OT_pick_game_dir,
     # Conversations
     MM_OT_add_conversation,
     MM_OT_remove_conversation,
