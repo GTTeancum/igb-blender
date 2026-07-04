@@ -49,6 +49,10 @@ _INPUT_DEFS = [
     ("Gloss/Mask Texture", "Color", (1.0, 1.0, 1.0, 1.0), None, None),
     # Per-vertex color (igVec4ucList / igColorAttr); white = no tint.
     ("Vertex Color",     "Color",  (1.0, 1.0, 1.0, 1.0), None, None),
+    # Display-only brightness multiplier (game-look modulate). XML2 maps bake
+    # lighting into DARK vertex colors and the fixed-function pipe renders
+    # them modulate-2X — set 2.0 there. NOT exported to IGB.
+    ("Brightness",       "Float",  1.0,   0.0, 4.0),
 
     # ── Material Colors (igMaterialAttr) ──
     ("Diffuse",          "Color",  (1.0, 1.0, 1.0, 1.0), None, None),
@@ -153,7 +157,12 @@ def get_or_create_igb_node_group():
         # (Base Texture × Diffuse × Color Tint × Vertex Color); without it the
         # group is the old "Base Texture only" wiring and just adding the input
         # would leave it unwired — so rebuild from scratch.
-        if 'Shader' not in existing_outputs or 'Vertex Color' not in existing_inputs:
+        # 'Brightness' marks the v5 wiring (unlit/baked-lighting branch driven
+        # by Lighting Enabled + brightness modulate) — older groups must be
+        # rebuilt, adding the input alone would leave the branch unwired.
+        if ('Shader' not in existing_outputs
+                or 'Vertex Color' not in existing_inputs
+                or 'Brightness' not in existing_inputs):
             bpy.data.node_groups.remove(ng)
             ng = None
         else:
@@ -512,9 +521,7 @@ def _build_internal_nodes(ng):
     # ── Principled BSDF (the core shader) ──
     bsdf = ng.nodes.new('ShaderNodeBsdfPrincipled')
     bsdf.location = (200, 0)
-
-    # Wire BSDF output → Group Output Shader
-    links.new(bsdf.outputs['BSDF'], go.inputs['Shader'])
+    # (BSDF → output goes through the lit/unlit Mix Shader wired below)
 
     # ── Base Color = Base Texture × Diffuse × Color Tint × Vertex Color ──
     # Faithful fixed-function combine. Base Texture / Color Tint / Vertex Color
@@ -540,7 +547,13 @@ def _build_internal_nodes(ng):
     cm3.name = "BaseColorMix"
     links.new(cm2.outputs['Vector'], cm3.inputs[0])
     links.new(gi.outputs['Vertex Color'], cm3.inputs[1])
-    links.new(cm3.outputs['Vector'], bsdf.inputs['Base Color'])
+
+    # ── × Brightness (game-look modulate, e.g. XML2 modulate-2X) ──
+    cmb = ng.nodes.new('ShaderNodeVectorMath')
+    cmb.operation = 'SCALE'; cmb.location = (80, 250); cmb.label = "x Brightness"
+    links.new(cm3.outputs['Vector'], cmb.inputs[0])
+    links.new(gi.outputs['Brightness'], cmb.inputs['Scale'])
+    links.new(cmb.outputs['Vector'], bsdf.inputs['Base Color'])
 
     # ── Alpha = Texture Alpha × Diffuse Alpha × Color Tint Alpha ──
     am1 = ng.nodes.new('ShaderNodeMath')
@@ -640,3 +653,43 @@ def _build_internal_nodes(ng):
     em_gt.inputs[1].default_value = 0.001
 
     links.new(em_gt.outputs[0], bsdf.inputs['Emission Strength'])
+
+    # ── Unlit branch (game fixed-function: lighting disabled) ─────────────
+    # When the game renders with lighting OFF, the final pixel is exactly
+    # texture × diffuse × tint × vertex color (× brightness) — no BSDF, no
+    # scene lights. XML2 map geometry ships with lighting baked into DARK
+    # vertex colors and relies on this path.
+    unlit_em = ng.nodes.new('ShaderNodeEmission')
+    unlit_em.location = (200, 500)
+    unlit_em.label = "Unlit Color"
+    links.new(cmb.outputs['Vector'], unlit_em.inputs['Color'])
+    unlit_em.inputs['Strength'].default_value = 1.0
+
+    unlit_transp = ng.nodes.new('ShaderNodeBsdfTransparent')
+    unlit_transp.location = (200, 380)
+
+    # honor alpha in the unlit path: alpha=0 → transparent, 1 → emission
+    unlit_alpha_mix = ng.nodes.new('ShaderNodeMixShader')
+    unlit_alpha_mix.location = (380, 450)
+    unlit_alpha_mix.label = "Unlit Alpha"
+    links.new(am2.outputs[0], unlit_alpha_mix.inputs['Fac'])
+    links.new(unlit_transp.outputs['BSDF'], unlit_alpha_mix.inputs[1])
+    links.new(unlit_em.outputs['Emission'], unlit_alpha_mix.inputs[2])
+
+    # Lighting Enabled < 0.5 → unlit branch
+    lit_lt = ng.nodes.new('ShaderNodeMath')
+    lit_lt.operation = 'LESS_THAN'
+    lit_lt.location = (380, 300)
+    lit_lt.label = "Lighting Off?"
+    links.new(gi.outputs['Lighting Enabled'], lit_lt.inputs[0])
+    lit_lt.inputs[1].default_value = 0.5
+
+    final_mix = ng.nodes.new('ShaderNodeMixShader')
+    final_mix.location = (560, 100)
+    final_mix.label = "Lit / Unlit"
+    links.new(lit_lt.outputs[0], final_mix.inputs['Fac'])
+    links.new(bsdf.outputs['BSDF'], final_mix.inputs[1])
+    links.new(unlit_alpha_mix.outputs['Shader'], final_mix.inputs[2])
+
+    go.location = (760, 100)
+    links.new(final_mix.outputs['Shader'], go.inputs['Shader'])

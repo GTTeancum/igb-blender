@@ -4,7 +4,8 @@ import math
 import os
 
 import bpy
-from bpy.props import StringProperty, IntProperty, EnumProperty, BoolProperty
+from bpy.props import (StringProperty, IntProperty, EnumProperty,
+                       BoolProperty, CollectionProperty, FloatProperty)
 from bpy.types import Operator
 
 from .entity_defs import (
@@ -2798,6 +2799,831 @@ class MM_OT_import_eng(Operator):
         return {'FINISHED'}
 
 
+class MM_OT_import_full_map(Operator):
+    """Import an existing game map (geometry + entities + settings) so it can be edited and rebuilt.
+
+    Pick the map's .igb (e.g. maps/act1/stark/stark1.igb). The operator:
+    - imports the map geometry (meshes, materials, lights, collision)
+    - finds the sibling .engb/.eng and imports all entity defs + instances
+    - fills in Map Maker settings (map name, map path, game data dir) from
+      the file's location so Build All can write a working replacement map
+    """
+    bl_idname = "mm.import_full_map"
+    bl_label = "Import Full Map"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    filepath: StringProperty(subtype='FILE_PATH')
+    filter_glob: StringProperty(default="*.igb", options={'HIDDEN'})
+
+    load_geometry: BoolProperty(
+        name="Import Map Geometry",
+        description="Import the map IGB (meshes, materials, lights, collision)",
+        default=True,
+    )
+    load_models: BoolProperty(
+        name="Load Entity Models",
+        description=("Import IGB model files referenced by entities "
+                     "(doors, props) from the game's models/ folder"),
+        default=True,
+    )
+    merge_models: BoolProperty(
+        name="Merge Models to Map",
+        description=(
+            "Merge imported models directly into the map geometry instead of "
+            "placing them as separate entity instances. Entities with scripts "
+            "are always kept as entities"
+        ),
+        default=False,
+    )
+    import_conversations: BoolProperty(
+        name="Import Conversations",
+        description="Auto-import conversation files referenced in precache entries",
+        default=True,
+    )
+    load_motionpaths: BoolProperty(
+        name="Import Motion Paths",
+        description=("Scan the map's scripts for motion path references and "
+                     "import them as animated empties + path curves"),
+        default=True,
+    )
+    load_npc_actors: BoolProperty(
+        name="Load NPC Actors",
+        description=("Import each NPC spawner's rigged character model with "
+                     "its idle animation, parented to the spawner empty "
+                     "(slower — one actor import per unique character)"),
+        default=True,
+    )
+    load_scene_audio: BoolProperty(
+        name="Import Scene Audio",
+        description=("Decode the map's ambience + music from its ZSNDPC "
+                     "sound banks into Video Sequencer strips so the scene "
+                     "plays with game audio"),
+        default=True,
+    )
+    game_look: BoolProperty(
+        name="Game Shading",
+        description=("Set up game-accurate rendering: raw-sRGB view "
+                     "transform, baked vertex lighting on map materials, "
+                     "converted game light energies"),
+        default=True,
+    )
+
+    def invoke(self, context, event):
+        # Start the file browser in the game's maps/ folder when known
+        settings = context.scene.mm_settings
+        if not self.filepath and settings.game_data_dir:
+            maps_dir = os.path.join(bpy.path.abspath(settings.game_data_dir), "maps")
+            if os.path.isdir(maps_dir):
+                self.filepath = maps_dir + os.sep
+        context.window_manager.fileselect_add(self)
+        return {'RUNNING_MODAL'}
+
+    def draw(self, context):
+        layout = self.layout
+        layout.prop(self, "load_geometry")
+        layout.prop(self, "load_models")
+        col = layout.column()
+        col.enabled = self.load_models
+        col.prop(self, "merge_models")
+        layout.prop(self, "import_conversations")
+        layout.prop(self, "load_motionpaths")
+        layout.prop(self, "load_npc_actors")
+        layout.prop(self, "load_scene_audio")
+        layout.prop(self, "game_look")
+
+    @staticmethod
+    def _derive_game_paths(map_dir):
+        """Walk up from the map folder to the dir containing maps/.
+
+        Returns (game_root, map_path) — e.g. for
+        <root>/maps/act1/stark → (<root>, "act1/stark").
+        Both empty strings if no maps/ ancestor exists.
+        """
+        parts = []
+        d = os.path.normpath(map_dir)
+        while True:
+            parent, name = os.path.split(d)
+            if not name:
+                return "", ""
+            if name.lower() == "maps":
+                return parent, "/".join(reversed(parts))
+            parts.append(name)
+            d = parent
+
+    def execute(self, context):
+        # Cursor progress for the long stages (geometry ~20 s, NPC actors
+        # ~35 s) so the UI doesn't look frozen.
+        wm = context.window_manager
+        try:
+            wm.progress_begin(0, 10)
+        except Exception:
+            wm = None
+        try:
+            return self._execute_stages(context, wm)
+        finally:
+            if wm is not None:
+                try:
+                    wm.progress_end()
+                except Exception:
+                    pass
+
+    @staticmethod
+    def _progress(wm, value):
+        if wm is not None:
+            try:
+                wm.progress_update(value)
+            except Exception:
+                pass
+
+    def _execute_stages(self, context, wm=None):
+        from .xml_gen import import_engb_xml
+
+        map_igb = os.path.abspath(self.filepath)
+        if not os.path.isfile(map_igb):
+            self.report({'ERROR'}, f"File not found: {map_igb}")
+            return {'CANCELLED'}
+
+        map_dir = os.path.dirname(map_igb)
+        base = os.path.splitext(os.path.basename(map_igb))[0]
+        game_root, map_path = self._derive_game_paths(map_dir)
+
+        # --- Map Maker settings from the file's location ---
+        settings = context.scene.mm_settings
+        settings.map_name = base
+        if map_path:
+            settings.map_path = map_path
+        if game_root:
+            settings.game_data_dir = game_root
+
+        msgs = []
+
+        # --- Map geometry ---
+        self._progress(wm, 1)
+        if self.load_geometry:
+            from ..importer.import_igb import import_igb
+            try:
+                result = import_igb(context, map_igb, operator=None)
+            except Exception as e:
+                self.report({'ERROR'}, f"Map geometry import failed: {e}")
+                return {'CANCELLED'}
+            if result != {'FINISHED'}:
+                self.report({'WARNING'}, "Map geometry import did not finish cleanly")
+            else:
+                coll = bpy.data.collections.get(base)
+                n_objs = len(coll.objects) if coll else 0
+                msgs.append(f"geometry: {n_objs} objects")
+
+        # --- Entities from the sibling .engb / .eng ---
+        self._progress(wm, 4)
+        eng_path = None
+        for ext in (".engb", ".eng"):
+            cand = os.path.join(map_dir, base + ext)
+            if os.path.isfile(cand):
+                eng_path = cand
+                break
+
+        if eng_path is None:
+            self.report(
+                {'WARNING'},
+                f"No {base}.engb next to the map IGB — imported geometry only")
+            self.report({'INFO'}, " | ".join(msgs) if msgs else "Nothing imported")
+            return {'FINISHED'}
+
+        try:
+            root = _parse_eng_file(eng_path)
+            stats = import_engb_xml(context.scene, root, skip_classes=set())
+        except Exception as e:
+            self.report({'ERROR'}, f"Entity import failed ({eng_path}): {e}")
+            return {'CANCELLED'}
+        msgs.append(f"{stats['entity_defs']} entity defs")
+        msgs.append(f"{stats['instances']} instances")
+        if stats['precache']:
+            msgs.append(f"{stats['precache']} precache")
+
+        # import_engb_xml may overwrite identity fields from the world entity;
+        # the file location is authoritative for an existing game map.
+        settings.map_name = base
+        if map_path:
+            settings.map_path = map_path
+
+        # --- Entity models (doors, props, …) ---
+        self._progress(wm, 5)
+        models_dir = os.path.join(game_root, "models") if game_root else ""
+        if self.load_models and models_dir and os.path.isdir(models_dir):
+            loaded, placed, missing, merged = _load_entity_models(
+                context, context.scene, models_dir, self,
+                merge_to_map=self.merge_models,
+            )
+            m = f"models: {loaded} loaded, {placed} placed"
+            if merged > 0:
+                m += f", {merged} merged"
+            if missing > 0:
+                m += f", {missing} missing"
+            msgs.append(m)
+            if loaded > 0:
+                _finalize_placed_models()
+        elif self.load_models and not models_dir:
+            self.report({'WARNING'},
+                        "Could not locate the game's models/ folder "
+                        "(map is not under a maps/ directory)")
+
+        # --- Conversations referenced by precache ---
+        if self.import_conversations:
+            conv_count = _import_conversations_from_precache(
+                context.scene, eng_path, self)
+            if conv_count > 0:
+                msgs.append(f"{conv_count} conversations")
+
+        # --- NPC actors (rigged characters + idle) at spawner empties ---
+        self._progress(wm, 7)
+        if self.load_npc_actors and game_root:
+            try:
+                n_npc, n_skipped = _load_npc_actors(
+                    context, context.scene, game_root, self)
+                if n_npc:
+                    m = f"{n_npc} NPC actors"
+                    if n_skipped:
+                        m += f" ({n_skipped} unresolved)"
+                    msgs.append(m)
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                self.report({'WARNING'}, f"NPC actor load failed: {e}")
+
+        # --- Scene audio (ambience + music) from the map's sound banks ---
+        self._progress(wm, 9)
+        if self.load_scene_audio and game_root:
+            try:
+                from .voice_audio import add_map_audio_strips
+                n_audio = add_map_audio_strips(
+                    context, game_root, settings.soundfile, base)
+                if n_audio:
+                    msgs.append(f"{n_audio} audio strips")
+            except Exception as e:
+                self.report({'WARNING'}, f"Scene audio failed: {e}")
+
+        # --- Game-accurate shading (view transform, baked lighting, lights) ---
+        if self.game_look:
+            try:
+                from .game_shading import apply_game_shading
+                gs = apply_game_shading(context)
+                msgs.append(f"game shading ({gs['baked_mats']} baked mats, "
+                            f"{gs['lights']} lights)")
+            except Exception as e:
+                self.report({'WARNING'}, f"Game shading failed: {e}")
+
+        # --- Motion paths referenced by the map's scripts ---
+        if self.load_motionpaths and game_root:
+            from .motionpath_import import (
+                find_map_motionpaths, parse_motionpath_igb,
+                build_motionpath_objects,
+            )
+            mp_files = find_map_motionpaths(game_root, map_path, base)
+            n_paths = 0
+            if mp_files:
+                mp_coll = bpy.data.collections.get("[MapMaker] Motion Paths")
+                if mp_coll is None:
+                    mp_coll = bpy.data.collections.new("[MapMaker] Motion Paths")
+                    context.scene.collection.children.link(mp_coll)
+                for mp_file in mp_files:
+                    try:
+                        tracks = parse_motionpath_igb(mp_file)
+                        n_paths += len(build_motionpath_objects(
+                            context, tracks, mp_coll, source_path=mp_file))
+                    except Exception as e:
+                        self.report({'WARNING'},
+                                    f"Motion path failed ({mp_file}): {e}")
+            if n_paths:
+                msgs.append(f"{n_paths} motion paths")
+
+        self.report({'INFO'}, f"Imported map '{base}': " + ", ".join(msgs))
+        return {'FINISHED'}
+
+
+def _pick_idle_animation(anims):
+    """Pick the best standing-around ParsedAnimation from a moveset.
+
+    Preference: exact 'idle' > any name containing 'idle' > calm poses
+    ('stand', 'talk', 'wait', 'menu') > first anim that isn't the fake
+    bind-pose ('afakeanim') or an action move.
+    """
+    if not anims:
+        return None
+    usable = [pa for pa in anims if pa.name.lower() != 'afakeanim']
+    if not usable:
+        return anims[0]
+    by_name = {pa.name.lower(): pa for pa in usable}
+    if 'idle' in by_name:
+        return by_name['idle']
+    for pa in usable:
+        if 'idle' in pa.name.lower():
+            return pa
+    for keyword in ('stand', 'talk', 'wait', 'menu'):
+        for pa in usable:
+            if keyword in pa.name.lower():
+                return pa
+    action_words = ('atk', 'attack', 'jump', 'death', 'hit', 'run', 'walk',
+                    'block', 'charge', 'throw', 'land', 'fall', 'stun',
+                    'knock', 'pain', 'swim')
+    for pa in usable:
+        n = pa.name.lower()
+        if not any(w in n for w in action_words):
+            return pa
+    return usable[0]
+
+
+def _load_npc_actors(context, scene, game_root, operator=None):
+    """Import rigged character models (+idle animation) at NPC spawner empties.
+
+    For each monsterspawnerent entity def: character → npcstat/herostat
+    (game_database) → skin IGB (actors/NNNN.igb) + moveset IGB
+    (actors/<characteranims>.igb). The skin is imported once per character
+    (briefing-loader pattern: hidden ref rig from the moveset skeleton +
+    build_action with rebase_unanimated_parents), then cheaply duplicated
+    for every additional spawner instance and parented to the spawner empty
+    so moving the empty moves the NPC.
+
+    Returns (placed_count, unresolved_count).
+    """
+    from .game_database import get_character_db, get_skin_actor_path
+    from ..actor.actor_import import import_actor
+    from ..actor.animation_builder import build_action
+    from ..actor.sg_animation import extract_animations
+    from ..actor.sg_skeleton import extract_skeleton
+    from ..igb_format.igb_reader import IGBReader
+
+    def report(level, msg):
+        if operator is not None:
+            operator.report({level}, msg)
+        else:
+            print(f"[{level}] {msg}")
+
+    char_db = get_character_db(game_root) or {}
+    # case-insensitive lookup (engb character fields vary in casing)
+    char_lut = {k.lower(): v for k, v in char_db.items()}
+
+    ents_coll = bpy.data.collections.get(ENTITY_COLLECTION_NAME)
+    if ents_coll is None:
+        return 0, 0
+
+    npc_coll = bpy.data.collections.get("[MapMaker] NPC Actors")
+    if npc_coll is None:
+        npc_coll = bpy.data.collections.new("[MapMaker] NPC Actors")
+        scene.collection.children.link(npc_coll)
+
+    # spawner defs → their instance empties
+    inst_by_type = {}
+    for obj in ents_coll.objects:
+        et = obj.get("mm_entity_type")
+        if et:
+            inst_by_type.setdefault(et, []).append(obj)
+
+    ref_rigs = {}      # characteranims -> (ref_arm, {anim_name: ParsedAnimation})
+    actor_cache = {}   # skin_path -> (armature, [mesh objs], action or None)
+    placed = 0
+    unresolved = 0
+
+    for ent in scene.mm_entity_defs:
+        if ent.classname != 'monsterspawnerent':
+            continue
+        instances = inst_by_type.get(ent.entity_name, [])
+        if not instances:
+            continue
+
+        char_key = (ent.character or ent.monster_name or "").strip().lower()
+        ci = char_lut.get(char_key)
+        if ci is None and ent.monster_name:
+            ci = char_lut.get(ent.monster_name.strip().lower())
+        if ci is None or not ci.skin:
+            unresolved += len(instances)
+            continue
+        skin_path = get_skin_actor_path(ci.skin, game_root)
+        if not skin_path or not os.path.exists(skin_path):
+            unresolved += len(instances)
+            continue
+
+        # --- moveset ref rig + idle anim (once per characteranims) ---
+        ref_entry = None
+        if ci.characteranims:
+            ref_entry = ref_rigs.get(ci.characteranims)
+            if ref_entry is None:
+                anim_path = os.path.join(
+                    game_root, "actors", f"{ci.characteranims}.igb")
+                if os.path.exists(anim_path):
+                    try:
+                        r = import_actor(
+                            context, anim_path, skin_filepaths=None,
+                            game_dir=game_root,
+                            options={"import_animations": False},
+                            operator=None)
+                        ref_arm = r[0] if r else None
+                        anims = {}
+                        if ref_arm is not None:
+                            ar = IGBReader(anim_path)
+                            ar.read()
+                            sk = extract_skeleton(ar)
+                            for pa in extract_animations(ar, sk):
+                                anims[pa.name] = pa
+                            for c in list(ref_arm.users_collection):
+                                c.objects.unlink(ref_arm)
+                            npc_coll.objects.link(ref_arm)
+                            ref_arm.hide_set(True)
+                            ref_arm.hide_render = True
+                            ref_arm["mm_npc_ref_rig"] = ci.characteranims
+                        ref_entry = (ref_arm, anims)
+                    except Exception as e:
+                        report('WARNING',
+                               f"Moveset load failed ({ci.characteranims}): {e}")
+                        ref_entry = (None, {})
+                else:
+                    ref_entry = (None, {})
+                ref_rigs[ci.characteranims] = ref_entry
+
+        # --- base actor (once per skin) ---
+        base = actor_cache.get(skin_path)
+        if base is None:
+            try:
+                r = import_actor(context, skin_path,
+                                 skin_filepaths=[(ci.skin, skin_path)],
+                                 game_dir=game_root,
+                                 options={"import_animations": False},
+                                 operator=None)
+            except Exception as e:
+                report('WARNING', f"Actor import failed ({ci.skin}): {e}")
+                unresolved += len(instances)
+                continue
+            if not r:
+                unresolved += len(instances)
+                continue
+            arm = r[0]
+            meshes = [o for (_v, o) in (r[1] or [])]
+            for obj in [arm] + meshes:
+                for c in list(obj.users_collection):
+                    c.objects.unlink(obj)
+                npc_coll.objects.link(obj)
+
+            action = None
+            if ref_entry is not None:
+                ref_arm, anims = ref_entry
+                pa = _pick_idle_animation(list(anims.values()))
+                if pa is not None and ref_arm is not None:
+                    try:
+                        action = build_action(
+                            arm, pa, bind_pose=None, fps=None,
+                            anim_armature=ref_arm,
+                            rebase_unanimated_parents=True,
+                            relative_translation=True,
+                            root_motion_mode='vertical')
+                    except Exception as e:
+                        report('WARNING',
+                               f"Idle apply failed ({ci.skin}): {e}")
+            if action is not None:
+                if arm.animation_data is None:
+                    arm.animation_data_create()
+                arm.animation_data.action = action
+            base = (arm, meshes, action)
+            actor_cache[skin_path] = base
+
+        # --- one placed actor per instance empty ---
+        base_arm, base_meshes, action = base
+        first_use = base_arm.parent is None and not base_arm.get("mm_npc_actor")
+        for i, empty in enumerate(instances):
+            if i == 0 and first_use:
+                arm, meshes = base_arm, base_meshes
+            else:
+                arm = base_arm.copy()
+                npc_coll.objects.link(arm)
+                if action is not None:
+                    if arm.animation_data is None:
+                        arm.animation_data_create()
+                    arm.animation_data.action = action
+                meshes = []
+                for m in base_meshes:
+                    nm = m.copy()
+                    nm.parent = arm
+                    for mod in nm.modifiers:
+                        if mod.type == 'ARMATURE' and mod.object == base_arm:
+                            mod.object = arm
+                    npc_coll.objects.link(nm)
+                    meshes.append(nm)
+            arm["mm_npc_actor"] = ent.entity_name
+            # Parent to the spawner empty: the empty (pos/orient from the
+            # .engb inst) is the transform source of truth for export.
+            arm.parent = empty
+            arm.matrix_parent_inverse.identity()
+            arm.location = (0.0, 0.0, 0.0)
+            arm.rotation_euler = (0.0, 0.0, 0.0)
+            placed += 1
+
+    return placed, unresolved
+
+
+class MM_OT_game_shading(Operator):
+    """Make the scene render like in-game: raw-sRGB view transform, baked vertex lighting on map materials, correct game light energies"""
+    bl_idname = "mm.game_shading"
+    bl_label = "Game Shading"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    baked_brightness: FloatProperty(
+        name="Baked Brightness",
+        description=("Multiplier for vertex-color baked map materials "
+                     "(the game renders these modulate-2X)"),
+        default=2.0, min=0.5, max=4.0,
+    )
+    light_power: FloatProperty(
+        name="Light Power",
+        description="Global multiplier on converted game light energies",
+        default=1.0, min=0.05, max=10.0,
+    )
+
+    def execute(self, context):
+        from .game_shading import apply_game_shading
+        try:
+            s = apply_game_shading(context,
+                                   baked_brightness=self.baked_brightness,
+                                   light_power=self.light_power,
+                                   operator=self)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self.report({'ERROR'}, f"Game shading failed: {e}")
+            return {'CANCELLED'}
+        self.report({'INFO'},
+                    f"Game shading: {s['baked_mats']} baked materials, "
+                    f"{s['lights']} lights converted, view=Standard")
+        return {'FINISHED'}
+
+
+def _find_game_installs():
+    """Scan Steam/GOG/common install paths for XML1/XML2/MUA game roots.
+
+    A game root = a directory containing maps/ + actors/ (and usually
+    XMen2.exe or Game.exe). Returns list of (label, path).
+    """
+    candidates = []
+
+    # Steam libraries from the registry
+    try:
+        import winreg
+        for hive, key in ((winreg.HKEY_CURRENT_USER, r"Software\Valve\Steam"),
+                          (winreg.HKEY_LOCAL_MACHINE,
+                           r"SOFTWARE\WOW6432Node\Valve\Steam")):
+            try:
+                with winreg.OpenKey(hive, key) as k:
+                    steam, _ = winreg.QueryValueEx(k, "SteamPath" if hive ==
+                                                   winreg.HKEY_CURRENT_USER
+                                                   else "InstallPath")
+                    candidates.append(os.path.join(steam, "steamapps",
+                                                   "common"))
+                    vdf = os.path.join(steam, "steamapps",
+                                       "libraryfolders.vdf")
+                    if os.path.isfile(vdf):
+                        import re
+                        text = open(vdf, "r", errors="replace").read()
+                        for m in re.finditer(r'"path"\s+"([^"]+)"', text):
+                            candidates.append(os.path.join(
+                                m.group(1).replace("\\\\", "\\"),
+                                "steamapps", "common"))
+            except OSError:
+                continue
+    except Exception:
+        pass
+
+    # Common fixed locations
+    for drive in "CDEFG":
+        for sub in (r"Program Files (x86)\Activision",
+                    r"Program Files\Activision",
+                    r"GOG Games", r"Games"):
+            candidates.append(f"{drive}:\\{sub}")
+
+    found = []
+    seen = set()
+    for root in candidates:
+        if not root or not os.path.isdir(root):
+            continue
+        try:
+            children = os.listdir(root)
+        except OSError:
+            continue
+        for child in children:
+            p = os.path.join(root, child)
+            key = os.path.normcase(p)
+            if key in seen or not os.path.isdir(p):
+                continue
+            seen.add(key)
+            if (os.path.isdir(os.path.join(p, "maps"))
+                    and os.path.isdir(os.path.join(p, "actors"))):
+                found.append((child, p))
+    return found
+
+
+class MM_OT_autodetect_game_dir(Operator):
+    """Scan Steam/GOG/common install folders for XML1/XML2/MUA and fill Game Data Dir"""
+    bl_idname = "mm.autodetect_game_dir"
+    bl_label = "Auto-Detect Game Folder"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        settings = context.scene.mm_settings
+        found = _find_game_installs()
+        if not found:
+            self.report({'WARNING'},
+                        "No game install found (looked in Steam libraries, "
+                        "Activision/GOG folders). Set Game Data Dir manually.")
+            return {'CANCELLED'}
+        # Prefer MUA > XML2 > first (MUA unlocks the most features)
+        def rank(item):
+            n = item[0].lower()
+            if "ultimate alliance" in n or "mua" in n:
+                return 0
+            if "legends ii" in n or "legends 2" in n or "xml2" in n:
+                return 1
+            return 2
+        found.sort(key=rank)
+        settings.game_data_dir = found[0][1]
+        extra = f" (+{len(found)-1} more found)" if len(found) > 1 else ""
+        self.report({'INFO'},
+                    f"Game Data Dir → {found[0][1]}{extra}")
+        return {'FINISHED'}
+
+
+class MM_OT_export_motionpath(Operator):
+    """Export the selected animated motion-path empty back to a motionpaths .igb (patches its original file as template)"""
+    bl_idname = "mm.export_motionpath"
+    bl_label = "Export Motion Path"
+    bl_options = {'REGISTER'}
+
+    filepath: StringProperty(subtype='FILE_PATH')
+    filter_glob: StringProperty(default="*.igb", options={'HIDDEN'})
+    sample_fps: FloatProperty(
+        name="Keys / Second",
+        description="Resample rate written to the file (native paths use 30)",
+        default=30.0, min=1.0, max=120.0,
+    )
+
+    @classmethod
+    def poll(cls, context):
+        o = context.active_object
+        return (o is not None and o.get("igb_motionpath") is not None
+                and o.animation_data is not None
+                and o.animation_data.action is not None)
+
+    def invoke(self, context, event):
+        o = context.active_object
+        src = o.get("igb_motionpath_src", "") if o else ""
+        if src:
+            self.filepath = src  # default: overwrite-in-place style path
+        context.window_manager.fileselect_add(self)
+        return {'RUNNING_MODAL'}
+
+    def execute(self, context):
+        from .motionpath_export import export_motionpath, sample_empty_track
+        empty = context.active_object
+        template = empty.get("igb_motionpath_src", "")
+        if not template or not os.path.exists(template):
+            self.report({'ERROR'},
+                        "No template: this empty wasn't imported from a "
+                        "motionpath .igb (igb_motionpath_src missing)")
+            return {'CANCELLED'}
+        try:
+            times, locs, quats, scales = sample_empty_track(
+                empty, fps=self.sample_fps)
+            n = export_motionpath(template, self.filepath, times, locs,
+                                  quats, scales)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self.report({'ERROR'}, f"Motion path export failed: {e}")
+            return {'CANCELLED'}
+        self.report({'INFO'},
+                    f"Wrote {n} keys ({times[-1]:.2f}s) → "
+                    f"{os.path.basename(self.filepath)}")
+        return {'FINISHED'}
+
+
+class MM_OT_simulate_play(Operator):
+    """Play the scene like in-game: looping staggered NPC idles, motion paths, spawn conditions, audio-synced playback"""
+    bl_idname = "mm.simulate_play"
+    bl_label = "Simulate Map"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    apply_conditions: BoolProperty(
+        name="Apply Spawn Conditions",
+        description=("Hide NPCs the game would not spawn at map load "
+                     "(script-spawned without instantspawn, hidden, "
+                     "startinactive)"),
+        default=True,
+    )
+    use_rendered: BoolProperty(
+        name="Rendered Viewport",
+        description=("Switch the viewport to Rendered shading (game lights); "
+                     "off = Material Preview (faster)"),
+        default=False,
+    )
+
+    def execute(self, context):
+        from .simulate import start_simulation
+        try:
+            s = start_simulation(context,
+                                 apply_conditions=self.apply_conditions,
+                                 use_rendered=self.use_rendered)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self.report({'ERROR'}, f"Simulation failed: {e}")
+            return {'CANCELLED'}
+        self.report({'INFO'},
+                    f"Simulating: {s['looped']} NPC idles looping, "
+                    f"{s['hidden']} hidden by spawn conditions, "
+                    f"{s['paths']} motion paths, {s['audio']} audio strips")
+        return {'FINISHED'}
+
+
+class MM_OT_simulate_stop(Operator):
+    """Stop the simulation and restore the scene (actions, visibility, paths)"""
+    bl_idname = "mm.simulate_stop"
+    bl_label = "Stop Simulation"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        from .simulate import stop_simulation
+        try:
+            s = stop_simulation(context)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self.report({'ERROR'}, f"Stop failed: {e}")
+            return {'CANCELLED'}
+        self.report({'INFO'},
+                    f"Simulation stopped: {s['restored']} actions restored, "
+                    f"{s['unhidden']} NPCs unhidden")
+        return {'FINISHED'}
+
+
+class MM_OT_import_motionpath(Operator):
+    """Import motion path IGB file(s) as animated empties + path curves"""
+    bl_idname = "mm.import_motionpath"
+    bl_label = "Import Motion Path"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    filepath: StringProperty(subtype='FILE_PATH')
+    directory: StringProperty(subtype='DIR_PATH')
+    files: CollectionProperty(type=bpy.types.OperatorFileListElement,
+                              options={'HIDDEN'})
+    filter_glob: StringProperty(default="*.igb", options={'HIDDEN'})
+
+    def invoke(self, context, event):
+        settings = context.scene.mm_settings
+        if not self.filepath and settings.game_data_dir:
+            mp_dir = os.path.join(
+                bpy.path.abspath(settings.game_data_dir), "motionpaths")
+            if os.path.isdir(mp_dir):
+                self.filepath = mp_dir + os.sep
+        context.window_manager.fileselect_add(self)
+        return {'RUNNING_MODAL'}
+
+    def execute(self, context):
+        from .motionpath_import import (
+            parse_motionpath_igb, build_motionpath_objects)
+
+        # Multi-select support: files + directory, else single filepath
+        paths = []
+        if self.files and self.directory:
+            paths = [os.path.join(self.directory, f.name)
+                     for f in self.files if f.name]
+        if not paths and self.filepath:
+            paths = [self.filepath]
+        paths = [p for p in paths if os.path.isfile(p)]
+        if not paths:
+            self.report({'ERROR'}, "No motion path file selected")
+            return {'CANCELLED'}
+
+        coll = bpy.data.collections.get("[MapMaker] Motion Paths")
+        if coll is None:
+            coll = bpy.data.collections.new("[MapMaker] Motion Paths")
+            context.scene.collection.children.link(coll)
+
+        n_paths = 0
+        for p in paths:
+            try:
+                tracks = parse_motionpath_igb(p)
+            except Exception as e:
+                self.report({'WARNING'}, f"Failed to parse {p}: {e}")
+                continue
+            if not tracks:
+                self.report({'WARNING'},
+                            f"No motion path tracks in {os.path.basename(p)}")
+                continue
+            n_paths += len(build_motionpath_objects(context, tracks, coll,
+                                                    source_path=p))
+
+        if n_paths == 0:
+            self.report({'ERROR'}, "No motion paths imported")
+            return {'CANCELLED'}
+        self.report({'INFO'}, f"Imported {n_paths} motion path(s)")
+        return {'FINISHED'}
+
+
 # ---------------------------------------------------------------------------
 # Conversation auto-import helpers (used by MM_OT_import_eng)
 # ---------------------------------------------------------------------------
@@ -4864,6 +5690,14 @@ _classes = (
     MM_OT_build_all,
     # Import
     MM_OT_import_eng,
+    MM_OT_import_full_map,
+    MM_OT_import_motionpath,
+    MM_OT_export_motionpath,
+    # Simulate / Game look
+    MM_OT_simulate_play,
+    MM_OT_simulate_stop,
+    MM_OT_game_shading,
+    MM_OT_autodetect_game_dir,
     # Conversations
     MM_OT_add_conversation,
     MM_OT_remove_conversation,

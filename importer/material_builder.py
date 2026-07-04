@@ -67,6 +67,43 @@ def _set_igb_material_prop_ui(mat):
             pass
 
 
+def _store_env_cube(mat, bsdf, env_cube):
+    """Store an igTextureCubeAttr's 6 faces + base losslessly on the material
+    (custom prop 'igb_env_cube', JSON+base64) so a v4 re-export can re-emit the
+    reflection cube byte-for-byte, and set the BSDF Metallic so the surface
+    reads reflective in Blender.
+    """
+    import base64
+    import json as _json
+
+    def _ser(pi):
+        if pi is None:
+            return None
+        return {
+            'w': pi.width, 'h': pi.height, 'pfmt': pi.pixel_format,
+            'name': pi.name or '',
+            'data': base64.b64encode(bytes(pi.pixel_data or b'')).decode('ascii'),
+        }
+
+    payload = {
+        'faces': [_ser(f) for f in (env_cube.get('faces') or [])],
+        'base': _ser(env_cube.get('base')),
+    }
+    try:
+        mat['igb_env_cube'] = _json.dumps(payload)
+    except (TypeError, ValueError):
+        return
+    # Reflective cue in Blender's viewport (the IGB cube is a baked low-res probe;
+    # Blender can't render it per-material as a cube, so metallic is the hint).
+    try:
+        if bsdf is not None:
+            m = bsdf.inputs.get('Metallic')
+            if m is not None:
+                m.default_value = 0.6
+    except (AttributeError, KeyError):
+        pass
+
+
 def _obj_cache_key(source_obj):
     """Get a hashable cache key from an IGB or IGZ source object."""
     if source_obj is None:
@@ -204,7 +241,8 @@ def build_material(parsed_material, parsed_texture=None,
     _set_igb_material_prop_ui(mat)
 
     # --- Apply extra material state attributes (custom props + visual) ---
-    _apply_extra_state(mat, bsdf, extra_state, nodes, links, blend_decision)
+    _apply_extra_state(mat, bsdf, extra_state, nodes, links, blend_decision,
+                       profile=profile)
 
     # --- Create IGB Material Settings node group ---
     _create_igb_settings_node(mat, parsed_material, extra_state)
@@ -446,7 +484,8 @@ def _apply_blend_decision(mat, blend_decision, extra_state):
             mat.alpha_threshold = alpha_func.get('ref', 0.5)
 
 
-def _apply_extra_state(mat, bsdf, extra_state, nodes, links, blend_decision):
+def _apply_extra_state(mat, bsdf, extra_state, nodes, links, blend_decision,
+                       profile=None):
     """Apply IGB material state attributes as Blender custom properties.
 
     Sets custom properties on the material for round-trip fidelity,
@@ -555,6 +594,17 @@ def _apply_extra_state(mat, bsdf, extra_state, nodes, links, blend_decision):
         mat["igb_cull_face_mode"] = cull_face.get('mode', 0)
         # Apply to Blender material setting
         mat.use_backface_culling = bool(cull_face.get('enabled', True))
+    else:
+        # No explicit igCullFaceAttr: use the game's default render state.
+        # XML2/MUA PC default to backface culling ON (single-sided) — map
+        # files carry no cull attrs and rely on it. XML1's console renderer
+        # draws world geometry double-sided, so its profiles set
+        # backface_cull_default=False. The igb_cull_face_* custom props stay
+        # unset so export still knows no explicit attr existed.
+        default_cull = True
+        if profile is not None:
+            default_cull = getattr(profile, 'backface_cull_default', True)
+        mat.use_backface_culling = default_cull
 
 
 def _insert_color_multiply(mat, bsdf, color, nodes, links):
@@ -662,7 +712,7 @@ def _create_igb_settings_node(mat, parsed_material, extra_state):
 
 def build_multitex_material(parsed_material, texture_role_map,
                             extra_state=None, name="Material",
-                            profile=None):
+                            profile=None, env_cube=None):
     """Create a Blender material from multi-texture data.
 
     Builds a Principled BSDF node tree with separate texture slots wired
@@ -848,6 +898,11 @@ def build_multitex_material(parsed_material, texture_role_map,
     mat["igb_flags"] = parsed_material.flags
     mat["igb_priority"] = parsed_material.priority
     _set_igb_material_prop_ui(mat)
+    # Environment / reflection cube (MUA unit 3): store the 6 faces + base
+    # losslessly for round-trip and mark the surface reflective (metallic) so it
+    # reads correctly in Blender and re-exports its sheen.
+    if env_cube is not None:
+        _store_env_cube(mat, bsdf, env_cube)
     mat["igz_format"] = True  # Mark as IGZ-sourced
 
     # Store texture roles for debugging/export
@@ -856,7 +911,8 @@ def build_multitex_material(parsed_material, texture_role_map,
             mat[f"igz_tex_{role}"] = img.name
 
     # --- Apply extra state (blend, alpha, color, cull) ---
-    _apply_extra_state(mat, bsdf, extra_state, nodes, links, blend_decision)
+    _apply_extra_state(mat, bsdf, extra_state, nodes, links, blend_decision,
+                       profile=profile)
 
     # --- Create IGB Material Settings node group ---
     _create_igb_settings_node(mat, parsed_material, extra_state)
@@ -1014,6 +1070,26 @@ def _get_or_create_blender_image(parsed_image, profile=None, is_normal_map=False
     if w == 0 or h == 0:
         return None
 
+    # ---- Disk cache: skip the DXT/CLUT decode on re-imports ----
+    # Keyed by CONTENT (pixel bytes + palette + decode params), so the same
+    # texture across files/sessions decodes exactly once. Big maps re-import
+    # near-instantly the second time.
+    disk_cache_path = _tex_disk_cache_path(parsed_image, swap_rb,
+                                           is_normal_map)
+    if disk_cache_path is not None and os.path.isfile(disk_cache_path):
+        try:
+            bl_image = bpy.data.images.load(disk_cache_path,
+                                            check_existing=False)
+            bl_image.name = base_name
+            bl_image.pack()
+            bl_image.filepath = ""
+            bl_image.filepath_raw = ""
+            if cache_key is not None:
+                _image_cache[cache_key] = bl_image.name
+            return bl_image
+        except Exception:
+            pass  # corrupt cache entry — fall through to a fresh decode
+
     # Convert pixel data to RGBA
     rgba_data = convert_image_to_rgba(parsed_image)
     if rgba_data is None:
@@ -1058,6 +1134,17 @@ def _get_or_create_blender_image(parsed_image, profile=None, is_normal_map=False
 
     bl_image.pixels.foreach_set(float_pixels)
 
+    # Save the decoded RGBA to the disk cache for instant future imports
+    if disk_cache_path is not None:
+        try:
+            bl_image.filepath_raw = disk_cache_path
+            bl_image.file_format = 'PNG'
+            bl_image.save()
+        except Exception:
+            pass
+        finally:
+            bl_image.filepath_raw = ""
+
     # Pack into blend file so it's not lost
     bl_image.pack()
 
@@ -1066,3 +1153,30 @@ def _get_or_create_blender_image(parsed_image, profile=None, is_normal_map=False
         _image_cache[cache_key] = bl_image.name
 
     return bl_image
+
+
+_TEX_CACHE_VERSION = "1"
+
+
+def _tex_disk_cache_path(parsed_image, swap_rb, is_normal_map):
+    """Content-hash PNG path in the shared decode cache, or None."""
+    try:
+        import hashlib
+        import tempfile
+        px = parsed_image.pixel_data
+        if not px:
+            return None
+        hs = hashlib.md5()
+        hs.update(px)
+        clut = getattr(parsed_image, 'clut_data', None)
+        if clut:
+            hs.update(bytes(clut))
+        hs.update(f"{_TEX_CACHE_VERSION}|{parsed_image.width}x"
+                  f"{parsed_image.height}|{parsed_image.pixel_format}|"
+                  f"{int(bool(swap_rb))}{int(bool(is_normal_map))}"
+                  .encode())
+        cache_dir = os.path.join(tempfile.gettempdir(), "igb_tex_cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        return os.path.join(cache_dir, hs.hexdigest() + ".png")
+    except Exception:
+        return None

@@ -120,6 +120,12 @@ class GameProfile:
     texture: TextureConfig = field(default_factory=TextureConfig)
     coordinate: CoordinateConfig = field(default_factory=CoordinateConfig)
 
+    # Default backface culling when a material has NO explicit igCullFaceAttr.
+    # PC games (XML2/MUA) default to single-sided; XML1's console renderer
+    # draws world geometry double-sided (nuke1_3: winding is normal-consistent
+    # yet in-game both faces show), so XML1 profiles set False.
+    backface_cull_default: bool = True
+
     # Auto-detection hints: class names that *should* be present in the
     # file's meta-object registry.  Used by detect_profile() to score
     # candidate profiles.  More matches = higher confidence.
@@ -213,6 +219,58 @@ def detect_profile(reader) -> GameProfile:
     if best_profile is None:
         best_profile = GAME_PROFILES.get("xml2_pc")
 
+    _path = ""
+    try:
+        _path = (getattr(reader, "filepath", "") or "").lower()
+    except Exception:
+        pass
+
+    # XML1 PS2 and XML2 PC files are byte-format IDENTICAL (v6 LE, v1
+    # geometry, CLUT) — the class-signature score is a coin toss between
+    # them, and since backface_cull_default diverged the winner matters.
+    # Resolve with the file's location when it names either game.
+    if (best_profile is not None
+            and best_profile.game_id in ("xml1_ps2", "xml2_pc")):
+        if any(k in _path for k in ("legends ii", "legends 2", "xml2")):
+            best_profile = GAME_PROFILES.get("xml2_pc", best_profile)
+        elif any(k in _path for k in ("xml1", "legends 1")):
+            best_profile = GAME_PROFILES.get("xml1_ps2", best_profile)
+        elif best_profile.game_id == "xml1_ps2":
+            # No path signal: prefer the PC profile — it's this addon's
+            # primary target and the safer default (single-sided culling).
+            best_profile = GAME_PROFILES.get("xml2_pc", best_profile)
+
+    # Ambiguity fix: a v6 skin exported FOR MUA (e.g. our animated mannequins
+    # at ui/models/mannequin/<id>.igb) has the same version + classes as an
+    # XML2 PC file, so it scores as xml2_pc — but its DXT color endpoints are
+    # BGR (swap_rb) and re-import comes out with red/blue swapped. When the
+    # class signature says XML2 but the file's textures are pure MUA-style
+    # DXT1/DXT5 (pfmt 14/16 — native XML2 ships DXT3=15 and CLUT=65536) AND
+    # the path says MUA (mannequin folder / game dir), prefer the MUA profile.
+    if best_profile is not None and best_profile.game_id == "xml2_pc":
+        path = ""
+        try:
+            path = (getattr(reader, "filepath", "") or "").lower()
+        except Exception:
+            pass
+        path_says_mua = any(k in path for k in
+                            ("mannequin", "ultimate alliance", "mua"))
+        if path_says_mua:
+            pfmts = set()
+            for obj in reader.objects:
+                try:
+                    if (hasattr(obj, "is_type")
+                            and obj.is_type(b"igImage")):
+                        for slot, val, fi in obj._raw_fields:
+                            if slot == 11 and fi.short_name == b"Enum":
+                                pfmts.add(val)
+                except Exception:
+                    continue
+            if pfmts and pfmts <= {14, 16}:
+                mua = GAME_PROFILES.get("mua_pc")
+                if mua is not None:
+                    return mua
+
     return best_profile
 
 
@@ -286,6 +344,7 @@ register_profile(GameProfile(
     game_id="xml1_ps2",
     game_name="X-Men Legends 1 (PS2)",
     engine_version="Alchemy 2.5",
+    backface_cull_default=False,
     min_version=5,
     max_version=7,
     expected_endian="little",
@@ -388,6 +447,7 @@ register_profile(GameProfile(
     game_id="xml1_gc",
     game_name="X-Men Legends 1 (GameCube)",
     engine_version="Alchemy 2.5",
+    backface_cull_default=False,
     min_version=5,
     max_version=7,
     expected_endian="little",
@@ -444,6 +504,7 @@ register_profile(GameProfile(
     game_id="xml1_xbox",
     game_name="X-Men Legends 1 (Xbox)",
     engine_version="Alchemy 2.5",
+    backface_cull_default=False,
     min_version=5,
     max_version=7,
     expected_endian="little",

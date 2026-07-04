@@ -453,19 +453,35 @@ def _import_materials_for_mesh(reader, mesh_obj, state, profile):
             TEX_ROLE_DIFFUSE, TEX_ROLE_NORMAL, TEX_ROLE_SPECULAR,
             TEX_ROLE_GLOSS,
         )
+        from ..scene_graph.sg_materials import extract_texture_cube
+        from ..igb_format.igb_objects import IGBObject as _IGBObj
         unit_to_role = {0: TEX_ROLE_DIFFUSE, 1: TEX_ROLE_NORMAL,
                         2: TEX_ROLE_SPECULAR, 5: TEX_ROLE_GLOSS}
         role_map = {}
+        env_cube = None
         for unit, tb in texbind_by_unit.items():
+            # unit 3 = environment / reflection cube (igTextureCubeAttr), not a
+            # plain igTextureAttr — resolve + parse its 6 faces for round-trip.
+            if unit == 3 and env_cube is None:
+                for _s, _v, _fi in tb._raw_fields:
+                    if (_fi.short_name == b"ObjectRef" and isinstance(_v, int)
+                            and _v != -1):
+                        _o = reader.resolve_ref(_v)
+                        if (isinstance(_o, _IGBObj)
+                                and _o.is_type(b"igTextureCubeAttr")):
+                            env_cube = extract_texture_cube(reader, _o)
+                            break
+                continue
             role = unit_to_role.get(unit)
             if role is None:
                 continue
             pt = extract_texture_bind(reader, tb, profile)
             if pt is not None and pt.image is not None:
                 role_map[role] = pt.image
-        if role_map:
+        if role_map or env_cube:
             blender_mat = build_multitex_material(
-                parsed_mat, role_map, name=mesh_obj.name, profile=profile)
+                parsed_mat, role_map, name=mesh_obj.name, profile=profile,
+                env_cube=env_cube)
 
     # Single-texture path (XML2 v6 and untextured meshes)
     if blender_mat is None:

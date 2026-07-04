@@ -89,7 +89,8 @@ def _meshpart_to_v8_tris(mesh_part, with_tangents=False):
 def export_skin(filepath, mesh_objs, armature_obj, operator=None, swap_rb=False,
                 texture_mode='dxt5', max_texture_size=0, actor_graph='OFF',
                 igb_format='V6', use_normal_maps=False, normal_map_size=0,
-                use_gloss_map=False, use_mipmaps=True, normal_y_flip=True):
+                use_gloss_map=False, use_mipmaps=True, normal_y_flip=True,
+                use_specular_maps=False):
     """Export Blender skin mesh(es) to an IGB file using from-scratch builder.
 
     Args:
@@ -112,14 +113,20 @@ def export_skin(filepath, mesh_objs, armature_obj, operator=None, swap_rb=False,
     from .skin_builder import SkinBuilder
     from .mesh_extractor import extract_skin_mesh, extract_mesh
 
+    # Fresh per-export texture-compression cache: a texture shared across several
+    # submeshes is then compressed once, not once per submesh (the ~2x speedup).
+    _reset_texture_compress_cache()
+
     # Normal maps are a MUA-only feature (DXT diffuse/normal/specular +
     # tangent-frame vertex streams). Both the 3ds Max v4 path and the native v8
     # path carry them; XML2's CLUT/v6 paths cannot — so gate to V4/V8.
-    if (use_normal_maps or use_gloss_map) and igb_format not in ('V4', 'V8'):
+    if ((use_normal_maps or use_specular_maps or use_gloss_map)
+            and igb_format not in ('V4', 'V8')):
         _report(operator, 'WARNING',
-                "Normal/gloss maps require the v4 (3ds Max) or v8 (MUA native) "
-                "skin format — ignoring them for this export")
+                "Normal/specular/gloss maps require the v4 (3ds Max) or v8 "
+                "(MUA native) skin format — ignoring them for this export")
         use_normal_maps = False
+        use_specular_maps = False
         use_gloss_map = False
 
     # Gloss/mask (texture unit 5). Native MUA ships it on v8, but MUA's engine
@@ -132,8 +139,8 @@ def export_skin(filepath, mesh_objs, armature_obj, operator=None, swap_rb=False,
         use_gloss_map = False
 
     if igb_format == 'V4':
-        if use_normal_maps:
-            # diffuse/normal/specular all ship as DXT for normal-mapped skins
+        if use_normal_maps or use_specular_maps or use_gloss_map:
+            # diffuse/normal/specular/gloss all ship as DXT when any map is on
             texture_mode = 'dxt5'
         elif texture_mode != 'clut':
             _report(operator, 'INFO',
@@ -374,9 +381,14 @@ def export_skin(filepath, mesh_objs, armature_obj, operator=None, swap_rb=False,
                 sub_dict['diffuse_pfmt'] = pfmt
                 sub_dict['clut_data'] = None
             else:
-                sub_dict['texture_levels'] = _get_texture(
+                # v4 MUA: diffuse = DXT1 when opaque. Native uses DXT1 (pfmt 14)
+                # for diffuse + specular and DXT5 only for the normal map, so this
+                # halves their size and matches native's pfmt.
+                levels, pfmt = _get_texture(
                     mesh_obj, swap_rb=swap_rb, mat_slot=mat_slot,
-                    max_texture_size=max_texture_size)
+                    max_texture_size=max_texture_size, dxt1=True, return_pfmt=True)
+                sub_dict['texture_levels'] = levels
+                sub_dict['diffuse_pfmt'] = pfmt
                 sub_dict['clut_data'] = None
 
             # Per-material "use this map" toggles let the user keep a map in
@@ -389,18 +401,30 @@ def export_skin(filepath, mesh_objs, armature_obj, operator=None, swap_rb=False,
             def _map_on(attr):
                 return _slot_mat is None or getattr(_slot_mat, attr, True)
 
-            # Normal-map path (MUA/v4/v8): also extract normal + specular maps,
-            # DXT-encoded, with their own size cap (normal_map_size).
-            if use_normal_maps and not is_outline:
-                nm_cap = normal_map_size or max_texture_size
-                if _map_on('igb_use_normal_map'):
+            # Normal-map path (MUA/v4/v8): extract normal + specular maps,
+            # DXT-encoded, each gated by its own EXPORT toggle (the per-material
+            # igb_use_* flags AND the operator's global tick). Normal and
+            # specular are independent, so you can ship one without the other.
+            if (use_normal_maps or use_specular_maps) and not is_outline:
+                # normal/spec/gloss inherit the global cap, and can only go
+                # SMALLER via normal_map_size — never ESCAPE it. So no map
+                # slips past the user's "Max Texture Size".
+                if normal_map_size and max_texture_size:
+                    nm_cap = min(normal_map_size, max_texture_size)
+                else:
+                    nm_cap = normal_map_size or max_texture_size
+                if use_normal_maps and _map_on('igb_use_normal_map'):
                     sub_dict['normal_levels'] = _get_texture_role(
                         mesh_obj, 'normal', swap_rb=swap_rb, mat_slot=mat_slot,
-                        max_texture_size=nm_cap, normal_y_flip=normal_y_flip)
-                if _map_on('igb_use_specular_map'):
-                    sub_dict['specular_levels'] = _get_texture_role(
+                        max_texture_size=nm_cap, normal_y_flip=normal_y_flip,
+                        operator=operator)
+                if use_specular_maps and _map_on('igb_use_specular_map'):
+                    _spec = _get_texture_role(
                         mesh_obj, 'specular', swap_rb=swap_rb, mat_slot=mat_slot,
-                        max_texture_size=nm_cap)
+                        max_texture_size=nm_cap, dxt1=True, return_pfmt=True,
+                        operator=operator)
+                    if _spec:
+                        sub_dict['specular_levels'], sub_dict['specular_pfmt'] = _spec
                 if sub_dict.get('normal_levels'):
                     _report(operator, 'INFO',
                             f"  + normal map for '{mesh_part.name}'"
@@ -409,10 +433,19 @@ def export_skin(filepath, mesh_objs, armature_obj, operator=None, swap_rb=False,
 
             # Gloss/mask (texture unit 5) — v8 only, its own toggle.
             if use_gloss_map and not is_outline and _map_on('igb_use_gloss_map'):
-                nm_cap = normal_map_size or max_texture_size
-                sub_dict['gloss_levels'] = _get_texture_role(
+                # normal/spec/gloss inherit the global cap, and can only go
+                # SMALLER via normal_map_size — never ESCAPE it. So no map
+                # slips past the user's "Max Texture Size".
+                if normal_map_size and max_texture_size:
+                    nm_cap = min(normal_map_size, max_texture_size)
+                else:
+                    nm_cap = normal_map_size or max_texture_size
+                _gl = _get_texture_role(
                     mesh_obj, 'gloss', swap_rb=swap_rb, mat_slot=mat_slot,
-                    max_texture_size=nm_cap)
+                    max_texture_size=nm_cap, dxt1=True, return_pfmt=True,
+                    operator=operator)
+                if _gl:
+                    sub_dict['gloss_levels'], sub_dict['gloss_pfmt'] = _gl
                 if sub_dict.get('gloss_levels'):
                     _report(operator, 'INFO',
                             f"  + gloss/mask map for '{mesh_part.name}'")
@@ -497,7 +530,102 @@ def export_skin(filepath, mesh_objs, armature_obj, operator=None, swap_rb=False,
             f"Exported skin to {os.path.basename(filepath)} "
             f"({total_verts} verts, {total_tris} tris, "
             f"{len(submeshes)} parts)")
+
+    # ---- 6. Size breakdown report ----
+    # Where the bytes went (textures vs geometry vs structure) plus the
+    # option that would shrink the file most. Profiling note: our from-
+    # scratch v6/v4 output is already at native size parity (0101 CLUT:
+    # 1,111,061 vs native 1,109,917 — pools byte-identical), so remaining
+    # size wins come from the texture OPTIONS, not the writer.
+    _report_size_breakdown(filepath, operator,
+                           texture_mode=texture_mode,
+                           max_texture_size=max_texture_size,
+                           use_mipmaps=use_mipmaps)
     return True
+
+
+def _report_size_breakdown(filepath, operator, texture_mode='dxt5',
+                           max_texture_size=0, use_mipmaps=True):
+    """Report texture/geometry/structure byte split + biggest shrink lever."""
+    try:
+        from ..igb_format.igb_reader import IGBReader
+        from ..igb_format.igb_objects import IGBObject, IGBMemoryBlock
+
+        total = os.path.getsize(filepath)
+        reader = IGBReader(filepath)
+        reader.read()
+
+        def mem_targets(obj):
+            out = []
+            for _slot, val, fi in obj._raw_fields:
+                if fi.short_name == b"MemoryRef" and val != -1:
+                    ref = reader.resolve_ref(val)
+                    if isinstance(ref, IGBMemoryBlock) and ref.data:
+                        out.append(ref)
+            return out
+
+        tex_blocks = set()
+        geo_blocks = set()
+        max_img_edge = 0
+        for obj in reader.objects:
+            if not isinstance(obj, IGBObject):
+                continue
+            tn = obj.type_name
+            if tn in (b"igImage", b"igClut"):
+                for m in mem_targets(obj):
+                    tex_blocks.add(m.index)
+                if tn == b"igImage":
+                    for slot, val, fi in obj._raw_fields:
+                        if (slot in (2, 3)
+                                and fi.short_name == b"UnsignedInt" and val):
+                            max_img_edge = max(max_img_edge, int(val))
+            elif (tn.startswith(b"igVertexArray")
+                  or tn.startswith(b"igIndexArray")
+                  or tn.startswith(b"igPrimLengthArray")):
+                for m in mem_targets(obj):
+                    geo_blocks.add(m.index)
+                    # positions/normals/uvs hang off the 80-byte external
+                    # indexed entry rather than the vertex array itself
+                    if len(m.data) in (76, 80):
+                        import struct as _s
+                        for i in range(len(m.data) // 4):
+                            idx = _s.unpack_from("<I", m.data, i * 4)[0]
+                            if idx != 0xFFFFFFFF and idx < len(reader.objects):
+                                r2 = reader.objects[idx]
+                                if isinstance(r2, IGBMemoryBlock) and r2.data:
+                                    geo_blocks.add(r2.index)
+
+        tex = sum(len(reader.objects[i].data) for i in tex_blocks)
+        geo = sum(len(reader.objects[i].data) for i in geo_blocks - tex_blocks)
+        other = total - tex - geo
+
+        def pct(n):
+            return f"{100.0 * n / max(total, 1):.0f}%"
+
+        _report(operator, 'INFO',
+                f"Size {total / 1024:.0f} KB — textures {tex / 1024:.0f} KB "
+                f"({pct(tex)}), geometry {geo / 1024:.0f} KB ({pct(geo)}), "
+                f"structure {other / 1024:.0f} KB ({pct(other)})")
+
+        # one actionable hint, biggest lever first
+        if tex > total * 0.4:
+            if max_texture_size == 0 and max_img_edge > 512:
+                _report(operator, 'INFO',
+                        f"Hint: textures up to {max_img_edge}px — 'Max "
+                        f"Texture Size' 512 would cut texture bytes "
+                        f"~{(1 - (512.0 / max_img_edge) ** 2) * 100:.0f}%")
+            elif texture_mode == 'clut':
+                _report(operator, 'INFO',
+                        "Hint: DXT texture mode halves opaque textures "
+                        "(DXT1) vs CLUT — measured ~16% smaller file on "
+                        "0101 Cyclops")
+            elif use_mipmaps:
+                _report(operator, 'INFO',
+                        "Hint: disabling mipmaps saves ~33% of texture "
+                        "bytes (in-game distant shimmer tradeoff)")
+    except Exception as e:
+        # Reporting must never fail an export
+        print(f"[IGB] size report skipped: {e}")
 
 
 # ============================================================================
@@ -1013,6 +1141,19 @@ def _read_igb_render_state(mat, result):
         result['cull_face_mode'] = mat.get("igb_cull_face_mode", 0)
 
 
+# Per-export cache of compressed texture levels, keyed by (image, params).
+# A skin's body atlas is typically shared across several submeshes (body, cape,
+# weapon segments...), and each submesh used to re-compress it from scratch —
+# ~47% of a skin export was redundant DXT of the same 1024² images. Memoizing by
+# image identity makes each unique texture compress exactly once per export.
+# Reset at the top of export_skin so edits to a texture recompress next time.
+_TEX_COMPRESS_CACHE = {}
+
+
+def _reset_texture_compress_cache():
+    _TEX_COMPRESS_CACHE.clear()
+
+
 def _get_texture(mesh_obj, swap_rb=False, mat_slot=0, max_texture_size=0,
                  dxt1=False, return_pfmt=False):
     """Extract texture data from a Blender mesh object's material.
@@ -1046,23 +1187,9 @@ def _get_texture(mesh_obj, swap_rb=False, mat_slot=0, max_texture_size=0,
     if mat is None or not mat.use_nodes or not mat.node_tree:
         return None
 
-    # Find image: check BSDF Base Color input first, then fallback to any TEX_IMAGE
-    bl_image = None
-    for node in mat.node_tree.nodes:
-        if node.type == 'BSDF_PRINCIPLED':
-            base_color = node.inputs.get('Base Color')
-            if base_color is not None and base_color.is_linked:
-                for link in base_color.links:
-                    if link.from_node.type == 'TEX_IMAGE' and link.from_node.image:
-                        bl_image = link.from_node.image
-                        break
-            break
-
-    if bl_image is None:
-        for node in mat.node_tree.nodes:
-            if node.type == 'TEX_IMAGE' and node.image:
-                bl_image = node.image
-                break
+    # Diffuse image via the group's Base Texture / BSDF Base Color — never the
+    # normal/spec/gloss map (fixes the normal-map-as-main-texture bug).
+    bl_image = _find_diffuse_image(mat)
 
     if bl_image is None:
         return None
@@ -1070,6 +1197,13 @@ def _get_texture(mesh_obj, swap_rb=False, mat_slot=0, max_texture_size=0,
     w, h = bl_image.size[0], bl_image.size[1]
     if w == 0 or h == 0:
         return None
+
+    ck = ('diffuse', bl_image.name, w, h, bool(swap_rb),
+          int(max_texture_size), bool(dxt1))
+    cached = _TEX_COMPRESS_CACHE.get(ck)
+    if cached is not None:
+        levels, pfmt = cached
+        return (levels, pfmt) if return_pfmt else levels
 
     rgba, w, h = _extract_image_rgba(bl_image, w, h, max_texture_size=max_texture_size)
 
@@ -1079,6 +1213,7 @@ def _get_texture(mesh_obj, swap_rb=False, mat_slot=0, max_texture_size=0,
     else:
         levels = compress_with_mipmaps(bytes(rgba), w, h, swap_rb=swap_rb)
         pfmt = 16  # RGBA_DXT5
+    _TEX_COMPRESS_CACHE[ck] = (levels, pfmt)
     if return_pfmt:
         return levels, pfmt
     return levels
@@ -1091,6 +1226,11 @@ def _find_role_image(mat, role):
     (or a direct Image Texture). role 'specular': image into 'Specular IOR
     Level' (or legacy 'Specular'). Returns a bpy Image or None.
     """
+    # A material with 'Use Nodes' off (e.g. FBX/OBJ-imported, or hand-created)
+    # has node_tree == None. Guard here so every caller — incl. the map-export
+    # role path that calls this directly — is safe on any material.
+    if mat is None or not mat.use_nodes or mat.node_tree is None:
+        return None
     nodes = mat.node_tree.nodes
     # The shader may be a raw Principled BSDF OR the ".IGB Material" node group
     # (Principled lives inside it). Earlier this only matched BSDF_PRINCIPLED, so
@@ -1139,9 +1279,137 @@ def _find_role_image(mat, role):
     return None
 
 
+def _find_diffuse_image(mat):
+    """Find the DIFFUSE (base colour) image, robust to the .IGB Material group.
+
+    Checks the group's 'Base Texture' input and a raw BSDF 'Base Color' FIRST,
+    so it never grabs the normal/specular/gloss map by falling through to "any
+    texture node" — the bug where the NORMAL map became the main texture after
+    Convert-to-IGB replaced the BSDF with the group (which has no top-level
+    BSDF_PRINCIPLED, so the old finder found none and took the first TEX_IMAGE,
+    often the normal). Only if no base socket is wired does it fall back to a
+    TEX_IMAGE that is NOT a role (normal/spec/gloss) map.
+    """
+    if mat is None or not mat.use_nodes or mat.node_tree is None:
+        return None
+    nodes = mat.node_tree.nodes
+    shader = next((n for n in nodes
+                   if n.type == 'BSDF_PRINCIPLED'
+                   or (n.type == 'GROUP' and n.node_tree is not None
+                       and n.node_tree.name == '.IGB Material')), None)
+    if shader is not None:
+        for sock in ('Base Texture', 'Base Color'):
+            inp = shader.inputs.get(sock)
+            if inp and inp.is_linked:
+                src = inp.links[0].from_node
+                if src.type == 'TEX_IMAGE' and src.image:
+                    return src.image
+    # Fallback: a TEX_IMAGE that isn't a role (normal/spec/gloss) map.
+    role_names = set()
+    for r in ('normal', 'specular', 'gloss'):
+        ri = _find_role_image(mat, r)
+        if ri is not None:
+            role_names.add(ri.name)
+    for node in nodes:
+        if (node.type == 'TEX_IMAGE' and node.image
+                and node.image.name not in role_names):
+            return node.image
+    return None
+
+
+def convert_normal_rgba_to_mua(src, normal_y_flip=True):
+    """Repack an RGBA8 normal map into MUA's DXT5nm channel layout.
+
+    Native MUA normal maps (decoded from 0104bladecybernetic: R=B~0,
+    G~126=normal.Y, A 0..255=normal.X): the Cg bump shader reads X from ALPHA
+    and Y from GREEN and reconstructs Z, so a plain RGB (blue) normal would
+    have its opaque alpha read as X -> wrong bumps. Repack: X -> alpha,
+    Y -> green (flipped to DirectX when normal_y_flip), R/B = 0.
+
+    The source's X can live in RED (a standard blue tangent-space normal:
+    R=X, G=Y, B=Z~255) OR already in ALPHA (a map imported from a native MUA
+    DXT5nm file, which has R=B=0) — detected by sampling the R/B means, so
+    both convert correctly and the operation is idempotent.
+
+    Returns a new bytearray (RGBA8, same size)."""
+    try:
+        import numpy as np
+    except ImportError:
+        np = None
+
+    if np is not None:
+        a = np.frombuffer(bytes(src), dtype=np.uint8).reshape(-1, 4)
+        step = max(1, len(a) // 4096)
+        r_mean = float(a[::step, 0].mean())
+        b_mean = float(a[::step, 2].mean())
+        x_in_alpha = (r_mean < 12.0 and b_mean < 12.0)
+        out = np.zeros_like(a)
+        nx = a[:, 3] if x_in_alpha else a[:, 0]        # X from alpha or red
+        ny = a[:, 1]                                   # Y from green
+        out[:, 1] = (255 - ny) if normal_y_flip else ny  # Y in green
+        out[:, 3] = nx                                 # X in alpha (DXT5nm)
+        return bytearray(out.tobytes())
+
+    # pure-python fallback (no numpy)
+    n = len(src) // 4
+    step = max(1, n // 4096)
+    idxs = range(0, n, step)
+    cnt = len(idxs) or 1
+    r_mean = sum(src[i * 4] for i in idxs) / cnt
+    b_mean = sum(src[i * 4 + 2] for i in idxs) / cnt
+    x_in_alpha = (r_mean < 12.0 and b_mean < 12.0)
+    out = bytearray(len(src))
+    for px in range(0, len(src), 4):
+        nx = src[px + 3] if x_in_alpha else src[px]   # X from alpha or red
+        ny = src[px + 1]                               # Y from green
+        out[px + 1] = (255 - ny) if normal_y_flip else ny  # Y in green
+        out[px + 3] = nx                               # X in alpha (DXT5nm)
+    return out
+
+
+def looks_like_normal_map(rgba):
+    """Heuristic: does this RGBA8 buffer look like a tangent-space normal map?
+
+    A blue tangent normal has BLUE as the dominant channel (flat = 128,128,255).
+    A native MUA DXT5nm normal has R=B~0 with a varying alpha (X in alpha). A
+    grayscale colour map (specular / gloss) has R==G==B and is NEVER a normal.
+
+    Used to stop a mis-wired specular/gloss (sitting on the material's Normal
+    input) from being silently repacked into a green-black DXT5nm map — the
+    "specular is green-black" bug. Real normals (blue OR DXT5nm) pass; grayscale
+    colour maps are rejected.
+    """
+    try:
+        import numpy as np
+    except ImportError:
+        np = None
+    if np is not None:
+        a = np.frombuffer(bytes(rgba), dtype=np.uint8).reshape(-1, 4)
+        step = max(1, len(a) // 4096)
+        s = a[::step, :3].astype(np.float32)
+        r, g, b = float(s[:, 0].mean()), float(s[:, 1].mean()), float(s[:, 2].mean())
+    else:
+        n = len(rgba) // 4
+        step = max(1, n // 4096)
+        idx = range(0, n, step)
+        c = len(idx) or 1
+        r = sum(rgba[i * 4] for i in idx) / c
+        g = sum(rgba[i * 4 + 1] for i in idx) / c
+        b = sum(rgba[i * 4 + 2] for i in idx) / c
+    # Already MUA DXT5nm (R and B near zero, X packed in alpha).
+    if r < 12.0 and b < 12.0:
+        return True
+    # Standard blue tangent-space normal: blue clearly dominant and high.
+    if b > 90.0 and b >= r + 6.0 and b >= g + 6.0:
+        return True
+    # Grayscale / colour map (spec, gloss, diffuse) — not a normal.
+    return False
+
+
 def _get_texture_role(mesh_obj, role, swap_rb=False, mat_slot=0,
-                      max_texture_size=0, normal_y_flip=True):
-    """Extract a normal/specular map as DXT5 levels, or None if absent.
+                      max_texture_size=0, normal_y_flip=True,
+                      dxt1=False, return_pfmt=False, operator=None):
+    """Extract a normal/specular/gloss map as DXT levels, or None if absent.
 
     Normal maps are repacked to DXT5nm (X->alpha, Y->green, Z reconstructed).
     MUA's Cg bump shader expects DirectX (green = Y-down); the importer flips
@@ -1150,7 +1418,8 @@ def _get_texture_role(mesh_obj, role, swap_rb=False, mat_slot=0,
     match native byte-for-byte. Turn OFF only for a map that is already DirectX
     in Blender (no importer round-trip). Specular passes through unchanged.
     """
-    from ..utils.dxt_compress import compress_with_mipmaps
+    from ..utils.dxt_compress import (
+        compress_with_mipmaps, compress_with_mipmaps_dxt1, rgba_is_opaque)
 
     if not mesh_obj.data.materials or mat_slot >= len(mesh_obj.data.materials):
         return None
@@ -1163,36 +1432,46 @@ def _get_texture_role(mesh_obj, role, swap_rb=False, mat_slot=0,
     w, h = bl_image.size[0], bl_image.size[1]
     if w == 0 or h == 0:
         return None
+
+    ck = ('role', bl_image.name, w, h, role, bool(swap_rb),
+          int(max_texture_size), bool(dxt1), bool(normal_y_flip))
+    cached = _TEX_COMPRESS_CACHE.get(ck)
+    if cached is not None:
+        levels, pfmt = cached
+        if levels is None:      # cached "skip" (e.g. non-normal on Normal input)
+            return None
+        return (levels, pfmt) if return_pfmt else levels
+
     rgba, w, h = _extract_image_rgba(bl_image, w, h,
                                      max_texture_size=max_texture_size)
     if role == 'normal':
-        # Native MUA normal maps use the DXT5nm layout (decoded from
-        # 0104bladecybernetic: R=B~0, G~126=normal.Y, A 0..255=normal.X). The
-        # shader reads X from ALPHA and Y from GREEN and reconstructs Z, so a
-        # plain RGB normal makes it read our opaque alpha as X -> wrong bumps.
-        # Repack: X -> alpha, Y -> green (flipped to DirectX), R/B = 0. R/B are
-        # unused so swap_rb is irrelevant here.
-        src = rgba
-        # The source's X can live in RED (a standard tangent-space normal, e.g.
-        # authored via a Normal Map node: R=X, G=Y, B=Z~255) OR in ALPHA (a map
-        # IMPORTED from a native MUA DXT5nm file, which has R=B=0 and X in alpha).
-        # Reading R=0 as X on an imported map was zeroing alpha and destroying
-        # the whole X component -> wrong bumps. Detect where X is and read it.
-        n = len(src) // 4
-        step = max(1, n // 4096)
-        idxs = range(0, n, step)
-        cnt = len(idxs) or 1
-        r_mean = sum(src[i * 4] for i in idxs) / cnt
-        b_mean = sum(src[i * 4 + 2] for i in idxs) / cnt
-        x_in_alpha = (r_mean < 12.0 and b_mean < 12.0)
-        rgba = bytearray(len(src))
-        for px in range(0, len(src), 4):
-            nx = src[px + 3] if x_in_alpha else src[px]   # X from alpha or red
-            ny = src[px + 1]                               # Y from green
-            rgba[px + 1] = (255 - ny) if normal_y_flip else ny  # Y in green
-            rgba[px + 3] = nx                              # X in alpha (DXT5nm)
-        return compress_with_mipmaps(bytes(rgba), w, h, swap_rb=False)
-    return compress_with_mipmaps(bytes(rgba), w, h, swap_rb=swap_rb)
+        # A grayscale/colour map mis-wired onto the material's Normal input would
+        # be repacked to DXT5nm (R=0,B=0,green-only) — the "specular is
+        # green-black" bug. Refuse to convert an image that isn't a normal map,
+        # and tell the user why, instead of silently producing garbage.
+        if not looks_like_normal_map(rgba):
+            _report(operator, 'WARNING',
+                    f"Material '{mat.name}': the image '{bl_image.name}' on the "
+                    f"Normal input isn't a normal map (looks like a colour/"
+                    f"grayscale map) — skipping normal export. If this is your "
+                    f"specular/gloss map, wire it to the Specular / Gloss input "
+                    f"instead of Normal.")
+            _TEX_COMPRESS_CACHE[ck] = (None, None)
+            return None
+        rgba = convert_normal_rgba_to_mua(rgba, normal_y_flip=normal_y_flip)
+        # Normal map MUST stay DXT5 (alpha carries X).
+        levels = compress_with_mipmaps(bytes(rgba), w, h, swap_rb=False)
+        pfmt = 16
+    # Specular / gloss (plain colour maps): DXT1 when opaque — native uses DXT1
+    # (pfmt 14) for these; fall back to DXT5 only if the map carries alpha.
+    elif dxt1 and rgba_is_opaque(rgba):
+        levels = compress_with_mipmaps_dxt1(bytes(rgba), w, h, swap_rb=swap_rb)
+        pfmt = 14
+    else:
+        levels = compress_with_mipmaps(bytes(rgba), w, h, swap_rb=swap_rb)
+        pfmt = 16
+    _TEX_COMPRESS_CACHE[ck] = (levels, pfmt)
+    return (levels, pfmt) if return_pfmt else levels
 
 
 def _get_texture_clut(mesh_obj, mat_slot=0, max_texture_size=0):
@@ -1217,24 +1496,8 @@ def _get_texture_clut(mesh_obj, mat_slot=0, max_texture_size=0):
     if mat is None or not mat.use_nodes or not mat.node_tree:
         return None
 
-    # Find image (same logic as _get_texture)
-    bl_image = None
-    for node in mat.node_tree.nodes:
-        if node.type == 'BSDF_PRINCIPLED':
-            base_color = node.inputs.get('Base Color')
-            if base_color is not None and base_color.is_linked:
-                for link in base_color.links:
-                    if link.from_node.type == 'TEX_IMAGE' and link.from_node.image:
-                        bl_image = link.from_node.image
-                        break
-            break
-
-    if bl_image is None:
-        for node in mat.node_tree.nodes:
-            if node.type == 'TEX_IMAGE' and node.image:
-                bl_image = node.image
-                break
-
+    # Diffuse image (group Base Texture / BSDF Base Color; never a role map).
+    bl_image = _find_diffuse_image(mat)
     if bl_image is None:
         return None
 
@@ -1263,22 +1526,8 @@ def _get_texture_cmpr(mesh_obj, mat_slot=0, max_texture_size=0):
     if mat is None or not mat.use_nodes or not mat.node_tree:
         return None
 
-    # Find the diffuse image (same logic as _get_texture_clut / _get_texture).
-    bl_image = None
-    for node in mat.node_tree.nodes:
-        if node.type == 'BSDF_PRINCIPLED':
-            base_color = node.inputs.get('Base Color')
-            if base_color is not None and base_color.is_linked:
-                for link in base_color.links:
-                    if link.from_node.type == 'TEX_IMAGE' and link.from_node.image:
-                        bl_image = link.from_node.image
-                        break
-            break
-    if bl_image is None:
-        for node in mat.node_tree.nodes:
-            if node.type == 'TEX_IMAGE' and node.image:
-                bl_image = node.image
-                break
+    # Diffuse image (group Base Texture / BSDF Base Color; never a role map).
+    bl_image = _find_diffuse_image(mat)
     if bl_image is None:
         return None
 
@@ -1452,5 +1701,10 @@ def _get_texture_name(mesh_obj, mat_slot=0):
 
 def _report(operator, level, msg):
     """Report a message through the operator if available."""
+    try:
+        from ..utils.igb_log import log as _igb_log
+        _igb_log(level, msg)
+    except Exception:
+        pass
     if operator:
         operator.report({level}, msg)

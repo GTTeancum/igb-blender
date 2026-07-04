@@ -1,7 +1,7 @@
 bl_info = {
     "name": "IGB Format (Alchemy Engine)",
     "author": "Kaiko",
-    "version": (0, 5, 1),
+    "version": (0, 6, 0),
     "blender": (4, 4, 0),
     "location": "File > Import/Export, 3D Viewport > Sidebar > IGB",
     "description": "Import/Export Alchemy Engine IGB/IGZ files for X-Men Legends, XML2, MUA. By Kaiko.",
@@ -53,17 +53,10 @@ def _export_texture_format_items(self, context):
 
 
 def _export_texture_resolution_items(self, context):
-    """Enum items for export texture resolution cap (max longest edge)."""
-    return [
-        ('original', "Original",
-         "Keep each texture's source size (rounded up to power-of-2)"),
-        ('1024', "1024",
-         "Cap each texture to 1024px on the longest edge"),
-        ('512', "512",
-         "Cap each texture to 512px on the longest edge"),
-        ('256', "256",
-         "Cap each texture to 256px on the longest edge"),
-    ]
+    """Shared texture-resolution cap (longest edge) — SAME control as the IGB
+    Actor 'Export Skin'. Defaults to 512 (first item). See exporter.texture_size."""
+    from .exporter.texture_size import texture_size_items
+    return texture_size_items(self, context)
 
 
 class ImportIGB(bpy.types.Operator, ImportHelper):
@@ -273,6 +266,23 @@ class ExportIGB(bpy.types.Operator, ExportHelper):
         options={'HIDDEN'},
     )
 
+    # Mirrors the IGB Actor export: pick the game, the exporter applies the
+    # correct texture encoding + map support automatically.
+    game_target: EnumProperty(
+        name="Game",
+        description="Which game this map/scene is for. The exporter picks "
+                    "the correct texture encoding automatically",
+        items=[
+            ('XML2', "X-Men Legends 2",
+             "DXT5 (XML2) or CLUT textures. XML2 has no normal maps"),
+            ('MUA', "Marvel Ultimate Alliance",
+             "DXT5 (MUA BGR) textures, with normal + specular + gloss maps "
+             "exported automatically (reads each material's Normal Map / "
+             "Specular / Gloss textures, same as the IGB Actor tab)"),
+        ],
+        default='XML2',
+    )
+
     texture_format: EnumProperty(
         name="Texture Format",
         description="Texture encoding format for game compatibility",
@@ -285,6 +295,34 @@ class ExportIGB(bpy.types.Operator, ExportHelper):
                     "Use lower values to shrink IGB file size",
         items=_export_texture_resolution_items,
     )
+
+    normal_y_flip: BoolProperty(
+        name="Flip Normal Green (Y)",
+        description="Convert Blender's OpenGL (Y-up) normal green back to "
+                    "MUA's DirectX (Y-down). Leave ON (default) — matches "
+                    "native MUA normal maps and the addon's importer",
+        default=True,
+    )
+
+    use_mipmaps: BoolProperty(
+        name="Generate Mipmaps",
+        description="Build the full mipmap chain for every texture (smoother "
+                    "at distance). Turn off to ship only the base level for a "
+                    "~33% smaller file — but distant surfaces may shimmer",
+        default=True,
+    )
+
+    # Internal knobs export_igb reads; set from game_target in execute().
+    # Per-map export toggles (MUA), default ON — untick to drop a map.
+    use_normal_maps: BoolProperty(name="Normal Maps",
+                                  description="Export normal maps (MUA)",
+                                  default=True)
+    use_specular_maps: BoolProperty(name="Specular Maps",
+                                    description="Export specular maps (MUA)",
+                                    default=True)
+    use_gloss_map: BoolProperty(name="Gloss / Mask Maps",
+                                description="Export gloss/mask maps (MUA)",
+                                default=True)
 
     collision_source: EnumProperty(
         name="Collision Source",
@@ -316,14 +354,43 @@ class ExportIGB(bpy.types.Operator, ExportHelper):
 
     def execute(self, context):
         from .exporter.export_igb import export_igb
+        # Apply the game's correct texture encoding + map support (mirrors
+        # the IGB Actor export: the game choice drives everything).
+        if self.game_target == 'MUA':
+            self.texture_format = 'dxt5_mua'
+            # export ticks carry the user's choice for MUA
+        else:
+            # XML2 keeps the texture-format choice, but never MUA encoding
+            if self.texture_format == 'dxt5_mua':
+                self.texture_format = 'dxt5_xml2'
+            self.use_normal_maps = False
+            self.use_specular_maps = False
+            self.use_gloss_map = False
         return export_igb(context, self.filepath, self)
 
     def draw(self, context):
         layout = self.layout
-        layout.label(text="Textures", icon='TEXTURE')
-        box = layout.box()
-        box.prop(self, "texture_format")
-        box.prop(self, "texture_resolution")
+        layout.prop(self, "game_target")
+        layout.prop(self, "texture_resolution")
+        layout.prop(self, "use_mipmaps")
+        # Show the format consequence (same pattern as the Actor export)
+        fmt = layout.box().column(align=True)
+        if self.game_target == 'MUA':
+            fmt.label(text="MUA (PC): DXT5 (MUA) textures", icon='CHECKMARK')
+            mp = layout.box().column(align=True)
+            mp.label(text="Export Maps:", icon='TEXTURE')
+            mp.prop(self, "use_normal_maps")
+            mp.prop(self, "use_specular_maps")
+            mp.prop(self, "use_gloss_map")
+            if self.use_normal_maps:
+                layout.prop(self, "normal_y_flip")
+        else:
+            fmt.label(text="XML2 (PC): DXT5 or CLUT textures", icon='SCENE')
+            fmt.label(text="No normal/specular maps (XML2 has none).",
+                      icon='INFO')
+            fmt.label(text="For normal maps, pick Marvel Ultimate Alliance.",
+                      icon='ERROR')
+            layout.prop(self, "texture_format")
         layout.separator()
         layout.label(text="Collision", icon='MOD_PHYSICS')
         box = layout.box()

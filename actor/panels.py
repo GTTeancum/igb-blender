@@ -249,7 +249,12 @@ class ACTOR_PT_QuickTools(Panel):
         if open:
             box.operator("actor.export_skin", text="Export Skin (.igb)",
                          icon='EXPORT')
-            box.label(text="Mannequin export lives in the Extras tab",
+            box.operator("actor.export_mannequin",
+                         text="Export Mannequin (Static)",
+                         icon='OUTLINER_OB_ARMATURE')
+            box.label(text="Static = current pose baked, no armature",
+                      icon='INFO')
+            box.label(text="Animated Mannequin lives in the Extras tab",
                       icon='INFO')
 
 
@@ -385,6 +390,19 @@ class ACTOR_PT_Skins(Panel):
         row = layout.row(align=True)
         row.operator("actor.add_mesh_as_skin", icon='ADD')
         row.operator("actor.remove_skin", icon='REMOVE')
+
+        # Weight mirroring — Blender's own X-mirror can't flip the mid-name
+        # game bone sides ('Bip01 L UpperArm'), so we provide our own.
+        box = layout.box()
+        box.label(text="Mirror Weights (game bone names)", icon='MOD_MIRROR')
+        row = box.row(align=True)
+        opl = row.operator("actor.mirror_weights", text="Left → Right")
+        opl.direction = 'L2R'
+        opr = row.operator("actor.mirror_weights", text="Right → Left")
+        opr.direction = 'R2L'
+        box.label(text="Select the skin MESH first. Paint one side,",
+                  icon='INFO')
+        box.label(text="then mirror onto the other.")
 
 
 class ACTOR_PT_Segments(Panel):
@@ -551,6 +569,49 @@ class ACTOR_PT_Animations(Panel):
                      icon='EXPORT')
 
 
+def _actor_material_meshes(context):
+    """Meshes whose materials the actor Materials panel edits.
+
+    Prefer the registered skins list, but fall back to the active armature's
+    skinned mesh children, then the active mesh — so the Materials tab works
+    for ANY imported actor even if its meshes were never added to the skins
+    list (the "1 mesh(es)" summary counts armature children, not props.skins).
+    Returns a de-duplicated list of mesh objects.
+    """
+    props = context.scene.igb_actor
+    out, seen = [], set()
+
+    def _add(mo):
+        if (mo is not None and getattr(mo, 'type', None) == 'MESH'
+                and mo.name not in seen):
+            out.append(mo)
+            seen.add(mo.name)
+
+    # 1. registered skins
+    for skin in props.skins:
+        _add(bpy.data.objects.get(skin.object_name))
+    if out:
+        return out
+
+    # 2. the active armature's skinned meshes
+    arm = (bpy.data.objects.get(props.active_armature)
+           if props.active_armature else None)
+    if arm is not None and arm.type == 'ARMATURE':
+        try:
+            from .rig_converter import _get_skinned_meshes
+            for mo in _get_skinned_meshes(arm):
+                _add(mo)
+        except Exception:
+            for c in arm.children_recursive:
+                _add(c)
+    if out:
+        return out
+
+    # 3. the active mesh
+    _add(context.active_object)
+    return out
+
+
 class ACTOR_PT_Materials(Panel):
     """Target-aware material editor: pick a material, edit what the game supports."""
     bl_label = "Materials"
@@ -563,36 +624,72 @@ class ACTOR_PT_Materials(Panel):
 
     @classmethod
     def poll(cls, context):
-        return context.scene.igb_actor.active_armature != ""
+        if context.scene.igb_actor.active_armature != "":
+            return True
+        ao = context.active_object
+        return ao is not None and ao.type == 'MESH'
 
     def draw(self, context):
         layout = self.layout
         props = context.scene.igb_actor
 
-        # Resolve the selected skin's mesh + its materials.
-        mesh_obj = None
-        materials = []
-        if props.skins_index < len(props.skins):
-            skin = props.skins[props.skins_index]
-            mesh_obj = bpy.data.objects.get(skin.object_name)
-            if mesh_obj:
-                materials = [m for m in mesh_obj.data.materials if m is not None]
-
-        if not materials:
-            layout.label(text="Select a skin to see its materials.", icon='INFO')
+        # Resolve the actor's skin mesh(es) + their materials (robust: works
+        # from the registered skins list OR the armature's meshes OR the active
+        # mesh, so an imported actor always shows its materials to edit).
+        meshes = _actor_material_meshes(context)
+        if not meshes:
+            layout.label(text="Import an actor (or select a skinned mesh)",
+                         icon='INFO')
+            layout.label(text="to edit its materials / maps.")
             return
 
-        # Target game decides which features to show.
-        arm = bpy.data.objects.get(props.active_armature)
-        target = arm.get("igb_target_game", "XML2") if arm else "XML2"
+        materials, seen = [], set()
+        for mo in meshes:
+            for m in mo.data.materials:
+                if m is not None and m.name not in seen:
+                    materials.append(m)
+                    seen.add(m.name)
+
+        # --- Target game: switch at will (drives map features + export format) ---
+        from .operators import actor_target_game, _igb_group_node
+        target = actor_target_game(context)
         is_mua = (target == 'MUA')
 
-        layout.label(text=f"{mesh_obj.name}  ·  Target: {target}",
-                     icon='MESH_DATA')
+        tbox = layout.box()
+        trow = tbox.row(align=True)
+        trow.label(text="Target Game:", icon='SCENE')
+        op = trow.operator("actor.set_target_game", text="XML2",
+                           depress=(target == 'XML2'))
+        op.target = 'XML2'
+        op = trow.operator("actor.set_target_game", text="MUA",
+                           depress=(target == 'MUA'))
+        op.target = 'MUA'
+        mname = (meshes[0].name if len(meshes) == 1
+                 else f"{len(meshes)} meshes")
+        tbox.label(text=mname, icon='MESH_DATA')
+
+        # --- Convert all skin materials to IGB (for this target) ---
+        igb_count = sum(1 for m in materials
+                        if _igb_group_node(m) is not None
+                        or any(k.startswith("igb_") for k in m.keys()))
+        crow = layout.row(align=True)
+        crow.scale_y = 1.2
+        crow.operator("actor.convert_skin_materials",
+                      text=f"Convert All to IGB ({target})",
+                      icon='NODE_MATERIAL')
+        if materials:
+            layout.label(
+                text=f"{igb_count}/{len(materials)} material(s) IGB-ready"
+                     + ("  — all set" if igb_count == len(materials) else ""),
+                icon='CHECKMARK' if igb_count == len(materials) else 'INFO')
+
+        if not materials:
+            layout.label(text="Skin mesh has no materials yet.", icon='INFO')
+            return
 
         # --- Material list: pick one to edit ---
         active_name = props.active_material_name
-        if not active_name or mesh_obj.data.materials.get(active_name) is None:
+        if not active_name or active_name not in seen:
             active_name = materials[0].name
         if len(materials) > 1:
             lst = layout.box().column(align=True)
@@ -602,7 +699,7 @@ class ACTOR_PT_Materials(Panel):
                                   icon='MATERIAL',
                                   depress=(m.name == active_name))
                 op.material_name = m.name
-        mat = mesh_obj.data.materials.get(active_name) or materials[0]
+        mat = bpy.data.materials.get(active_name) or materials[0]
 
         self._draw_material(layout, props, mat, is_mua)
 
@@ -623,8 +720,8 @@ class ACTOR_PT_Materials(Panel):
                    any(k.startswith("igb_") for k in mat.keys()))
         if not has_igb:
             box.label(text="Not an IGB material yet.", icon='INFO')
-            box.operator("igb.convert_materials",
-                         text="Convert Materials to IGB", icon='MATERIAL')
+            box.operator("actor.convert_skin_materials",
+                         text="Convert All to IGB", icon='MATERIAL')
             return
 
         # Material colors (collapsible).
@@ -649,33 +746,46 @@ class ACTOR_PT_Materials(Panel):
                 rbox.prop(mat, '["igb_cull_face_enabled"]',
                           text="Backface Culling")
 
-        # Texture maps (collapsible) — normal / specular / gloss are MUA-only.
-        if is_mua:
-            mbox, mopen = _collapsible(box, props, "show_material_maps",
-                                       "Texture Maps (MUA)", 'TEXTURE')
-            if mopen:
-                if _igb_group_node(mat) is None:
-                    mbox.label(text="Convert to IGB material to add maps.",
-                               icon='INFO')
-                else:
+        # Texture maps (collapsible). Base Color for BOTH games (the one texture
+        # XML2 uses); normal / specular / gloss are MUA-only, below it.
+        mbox, mopen = _collapsible(box, props, "show_material_maps",
+                                   "Texture Maps", 'TEXTURE')
+        if mopen:
+            if _igb_group_node(mat) is None:
+                mbox.label(text="Convert to IGB material to edit maps.",
+                           icon='INFO')
+            else:
+                self._map_row(mbox, mat, 'diffuse', "Base Color", None,
+                              _role_map_node)
+                if is_mua:
                     self._map_row(mbox, mat, 'normal', "Normal",
                                   "igb_use_normal_map", _role_map_node)
                     self._map_row(mbox, mat, 'specular', "Specular",
                                   "igb_use_specular_map", _role_map_node)
                     self._map_row(mbox, mat, 'gloss', "Gloss/Mask",
                                   "igb_use_gloss_map", _role_map_node)
-                    mbox.label(text="All three export on MUA (units 0/1/2/5).",
-                               icon='INFO')
-        else:
-            box.label(text="XML2 uses one diffuse texture (no maps).",
-                      icon='INFO')
+                    mbox.label(text="Normal/spec/gloss export on MUA "
+                                    "(units 0/1/2/5).", icon='INFO')
+                    mbox.label(text="Blue normal maps auto-convert to MUA "
+                                    "on export.", icon='CHECKMARK')
+                    if _role_map_node(mat, 'normal') is not None and \
+                            getattr(_role_map_node(mat, 'normal'), 'image',
+                                    None) is not None:
+                        opc = mbox.operator("actor.convert_normal_mua",
+                                            icon='NODE_TEXTURE')
+                        opc.material_name = mat.name
+                else:
+                    mbox.label(text="XML2 uses only the Base Color "
+                                    "(no normal maps).", icon='INFO')
 
     @staticmethod
     def _map_row(layout, mat, role, label, use_prop, role_node_fn):
         row = layout.row(align=True)
-        row.prop(mat, use_prop, text="")
+        # use_prop=None -> no on/off toggle (e.g. Base Color, always exported).
+        if use_prop:
+            row.prop(mat, use_prop, text="")
         sub = row.row(align=True)
-        sub.enabled = getattr(mat, use_prop, True)
+        sub.enabled = getattr(mat, use_prop, True) if use_prop else True
         sub.label(text=label)
         node = role_node_fn(mat, role)
         if node is not None:
@@ -722,14 +832,16 @@ class ACTOR_PT_Materials(Panel):
         op.skins_only = True
         op.show_dialog = True
 
+        # Shininess = specular exponent: higher = tighter highlight = LESS
+        # overall shine. "Less Shiny" tightens it; "Soft" is the native look.
         row = box.row(align=True)
-        op = row.operator("igb.set_all_shininess", text="Matte (0)",
+        op = row.operator("igb.set_all_shininess", text="Soft (native)",
                           icon='MATPLANE')
-        op.shininess = 0.0
+        op.shininess = 1.28
         op.skins_only = True
-        op = row.operator("igb.set_all_shininess", text="Shiny (64)",
+        op = row.operator("igb.set_all_shininess", text="Less Shiny",
                           icon='SHADING_RENDERED')
-        op.shininess = 64.0
+        op.shininess = 32.0
         op.skins_only = True
 
 
@@ -991,38 +1103,69 @@ class ACTOR_PT_VMC(Panel):
         layout = self.layout
         props = context.scene.igb_actor
 
-        has_vmc4b = hasattr(context.scene, 'vmc4b_target_armature')
-        if not has_vmc4b:
-            box = layout.box()
-            box.label(text="VMC4B addon not installed.", icon='ERROR')
-            box.label(text="Install VMC4B to use VR motion capture.")
-            return
-
         if not props.active_armature:
             layout.label(text="Load an actor first.", icon='INFO')
             return
 
         armature_obj = bpy.data.objects.get(props.active_armature)
-        is_configured = (armature_obj and
-                         "vmc_use_standard_orientations" in armature_obj)
 
-        # ---- Setup ----
+        # ---- Retarget from a VR / Unity source armature ----
+        # Works with any addon that drives a Unity-named armature (not just
+        # VMC4B): pick the source, record your take onto it, then retarget.
         box = layout.box()
-        box.label(text="VMC4B Setup", icon='ARMATURE_DATA')
-        if is_configured:
-            box.label(text="Orientation correction active", icon='CHECKMARK')
-            vmc_target = context.scene.vmc4b_target_armature
-            icon = ('CHECKMARK' if armature_obj and
-                    vmc_target == armature_obj.name else 'INFO')
-            box.label(text=f"VMC4B target: {vmc_target}", icon=icon)
-            row = box.row(align=True)
-            row.operator("actor.setup_vmc4b", text="Reconfigure",
-                         icon='FILE_REFRESH')
-            row.operator("actor.cleanup_vmc", text="Remove", icon='TRASH')
+        box.label(text="Retarget VR / Mocap Take", icon='ARMATURE_DATA')
+        box.prop_search(props, "vr_source_armature", bpy.data, "objects",
+                        text="Source Rig")
+        src = bpy.data.objects.get(props.vr_source_armature)
+        if src and src.type != 'ARMATURE':
+            box.label(text="Pick an armature.", icon='ERROR')
+        elif src:
+            src_action = (src.animation_data.action
+                          if src.animation_data else None)
+            if src_action:
+                fr = src_action.frame_range
+                box.label(text=f"Take: {src_action.name} "
+                               f"({int(fr[1] - fr[0])} frames)", icon='ACTION')
+            else:
+                box.label(text="Source has no recorded Action yet.",
+                          icon='INFO')
+            box.prop(props, "vr_use_action_range")
+            if not props.vr_use_action_range:
+                row = box.row(align=True)
+                row.prop(props, "vr_frame_start")
+                row.prop(props, "vr_frame_end")
+            box.prop(props, "vr_root_motion")
+            box.operator("actor.vr_retarget", text="Retarget onto Actor",
+                         icon='CON_ARMATURE')
+            box.label(text="Then Export as New IGB below.", icon='EXPORT')
         else:
-            box.label(text="Binds VMC4B bones and enables", icon='INFO')
-            box.label(text="orientation correction for XML2 rigs.")
-            box.operator("actor.setup_vmc4b", text="Setup VMC4B", icon='LINKED')
+            box.label(text="Pick the armature your VR addon drives.",
+                      icon='INFO')
+
+        # ---- VMC4B live-drive setup (only if that addon is installed) ----
+        has_vmc4b = hasattr(context.scene, 'vmc4b_target_armature')
+        if has_vmc4b:
+            layout.separator()
+            is_configured = (armature_obj and
+                             "vmc_use_standard_orientations" in armature_obj)
+            box = layout.box()
+            box.label(text="VMC4B Live Setup", icon='LINKED')
+            if is_configured:
+                box.label(text="Orientation correction active",
+                          icon='CHECKMARK')
+                vmc_target = context.scene.vmc4b_target_armature
+                icon = ('CHECKMARK' if armature_obj and
+                        vmc_target == armature_obj.name else 'INFO')
+                box.label(text=f"VMC4B target: {vmc_target}", icon=icon)
+                row = box.row(align=True)
+                row.operator("actor.setup_vmc4b", text="Reconfigure",
+                             icon='FILE_REFRESH')
+                row.operator("actor.cleanup_vmc", text="Remove", icon='TRASH')
+            else:
+                box.label(text="Binds VMC4B bones and enables", icon='INFO')
+                box.label(text="orientation correction for XML2 rigs.")
+                box.operator("actor.setup_vmc4b", text="Setup VMC4B",
+                             icon='LINKED')
 
         # ---- Export ----
         layout.separator()
@@ -1042,6 +1185,154 @@ class ACTOR_PT_VMC(Panel):
         else:
             box.label(text="No animation data", icon='INFO')
         box.operator("actor.export_anim_scratch", text="Export as New IGB",
+                     icon='FILE_NEW')
+
+
+# ===========================================================================
+# IGB Mocap / Briefings — its own N-panel tab.
+# The game plays a briefing on dedicated 65-bone MOCAP MODELS (npcstat <char>_MC
+# -> skin 200xx) with the zone performances applied DIRECTLY (no retarget). This
+# tab exposes that: load a whole briefing, or a single mocap model + performance,
+# plus a retarget path for putting a performance on a custom character, and
+# export back to the zone format.
+# ===========================================================================
+
+class MOCAP_PT_Main(Panel):
+    """Root panel for the IGB Mocap / Briefings tab."""
+    bl_label = "IGB Mocap / Briefings"
+    bl_idname = "MOCAP_PT_Main"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = "IGB Mocap"
+
+    def draw(self, context):
+        layout = self.layout
+        col = layout.column(align=True)
+        col.label(text="Cutscene mocap & briefings", icon='SEQUENCE')
+        col.label(text="Loads the real 65-bone mocap models and", icon='INFO')
+        col.label(text="plays zone performances directly (no retarget).")
+
+
+class MOCAP_PT_Briefings(Panel):
+    """One-click load of a full briefing cutscene."""
+    bl_label = "Briefings"
+    bl_idname = "MOCAP_PT_Briefings"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = "IGB Mocap"
+    bl_parent_id = "MOCAP_PT_Main"
+
+    def draw(self, context):
+        layout = self.layout
+        box = layout.box()
+        box.label(text="Load a whole briefing cutscene", icon='PLAY')
+        box.label(text="map + mocap models + performances", icon='INFO')
+        box.label(text="+ staging marks + voice audio")
+        box.operator("actor.load_briefing", text="Load Briefing…",
+                     icon='IMPORT')
+        box.label(text="XML2/MUA: maps/briefing/<b>.igb", icon='FILE_FOLDER')
+        box.label(text="XML1: maps/mocap/mocapN/<b>.igb")
+        box.label(text="Set 'Asset Root' to force the data folder")
+
+
+class MOCAP_PT_Models(Panel):
+    """Load a single mocap model and direct-apply zone performances."""
+    bl_label = "Mocap Models"
+    bl_idname = "MOCAP_PT_Models"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = "IGB Mocap"
+    bl_parent_id = "MOCAP_PT_Main"
+
+    def draw(self, context):
+        layout = self.layout
+        props = context.scene.igb_actor
+
+        box = layout.box()
+        box.label(text="1. Load a mocap model", icon='OUTLINER_OB_ARMATURE')
+        box.label(text="65-bone models: actors/200xx.igb", icon='INFO')
+        box.operator("actor.import_actor", text="Load Mocap Model…",
+                     icon='IMPORT')
+
+        box = layout.box()
+        box.label(text="2. Apply performances (direct)", icon='ACTION')
+        tgt = (bpy.data.objects.get(props.active_armature)
+               if props.active_armature else None)
+        box.label(text=f"Model: {tgt.name if tgt else '(load a model)'}",
+                  icon='OUTLINER_OB_ARMATURE')
+        box.operator("actor.load_mocap_performances",
+                     text="Load Performances…", icon='IMPORT')
+        box.label(text="Pick actors/zone_*.igb — no retarget",
+                  icon='FILE_FOLDER')
+
+        box = layout.box()
+        box.label(text="3. Rig display", icon='BONE_DATA')
+        box.operator("actor.connect_bones", text="Connect Bones",
+                     icon='CONSTRAINT_BONE')
+        box.label(text="Connects the chain; mesh + anim kept.", icon='INFO')
+
+
+class MOCAP_PT_Retarget(Panel):
+    """Retarget a performance onto a DIFFERENT / custom character (for skins
+    that aren't a matching mocap model). Uses the world-delta retarget."""
+    bl_label = "Retarget onto Custom Character"
+    bl_idname = "MOCAP_PT_Retarget"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = "IGB Mocap"
+    bl_parent_id = "MOCAP_PT_Main"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        layout = self.layout
+        props = context.scene.igb_actor
+        layout.label(text="For custom skins with a different rig.", icon='INFO')
+        layout.label(text="Matching mocap models don't need this.")
+
+        box = layout.box()
+        box.operator("actor.import_mocap", text="Import Mocap Rig (source)",
+                     icon='ARMATURE_DATA')
+        box.prop_search(props, "mocap_source_armature", bpy.data, "objects",
+                        text="Mocap Rig")
+        src = bpy.data.objects.get(props.mocap_source_armature)
+        if src and src.type == 'ARMATURE':
+            perf = src.animation_data.action if src.animation_data else None
+            if perf:
+                fr = perf.frame_range
+                box.label(text=f"Performance: {perf.name} "
+                               f"({int(fr[1] - fr[0])} frames)", icon='ACTION')
+            else:
+                box.label(text="Pick a performance (Action) on the rig",
+                          icon='ERROR')
+        tgt = (bpy.data.objects.get(props.active_armature)
+               if props.active_armature else None)
+        box.label(text=f"Target: {tgt.name if tgt else '(load an actor)'}",
+                  icon='OUTLINER_OB_ARMATURE')
+        box.prop(props, "mocap_root_motion")
+        box.prop(props, "mocap_full_range")
+        if not props.mocap_full_range:
+            row = box.row(align=True)
+            row.prop(props, "mocap_frame_start")
+            row.prop(props, "mocap_frame_end")
+        box.operator("actor.retarget_mocap", text="Retarget onto Actor",
+                     icon='CON_ARMATURE')
+
+
+class MOCAP_PT_Export(Panel):
+    """Export the active model's Action back to the zone mocap format."""
+    bl_label = "Export Performance"
+    bl_idname = "MOCAP_PT_Export"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = "IGB Mocap"
+    bl_parent_id = "MOCAP_PT_Main"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        layout = self.layout
+        box = layout.box()
+        box.label(text="Active model's Action → zone mocap IGB", icon='INFO')
+        box.operator("actor.export_mocap", text="Export Mocap (zone IGB)",
                      icon='FILE_NEW')
 
 
@@ -1067,6 +1358,12 @@ _classes = (
     ACTOR_PT_Mannequin,
     ACTOR_PT_VMC,
     ACTOR_PT_AnimConverter,
+    # Dedicated "IGB Mocap" tab (parent registers before its children).
+    MOCAP_PT_Main,
+    MOCAP_PT_Briefings,
+    MOCAP_PT_Models,
+    MOCAP_PT_Retarget,
+    MOCAP_PT_Export,
 )
 
 

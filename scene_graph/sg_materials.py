@@ -363,6 +363,39 @@ def extract_texture_bind(reader, texbind_obj, profile=None):
     return tex
 
 
+def extract_texture_cube(reader, cube_obj):
+    """Parse an igTextureCubeAttr (environment / reflection cube, MUA unit 3).
+
+    igTextureCubeAttr inherits igTextureAttr, so slot 12 = a base igImage
+    ("sphereImage") and slot 19 = an ObjectRefArray of the 6 cube-face igImage
+    indices. Native env cubes = 6 x 32x32 L8 grayscale faces (blade_env.png.cube_0..5).
+
+    Returns a dict {'faces': [ParsedImage x6], 'base': ParsedImage|None} or None.
+    """
+    if not isinstance(cube_obj, IGBObject):
+        return None
+    faces = []
+    base = None
+    for slot, val, fi in cube_obj._raw_fields:
+        if slot == 12 and fi.short_name == b"ObjectRef" and val not in (-1, None):
+            img = reader.resolve_ref(val)
+            if isinstance(img, IGBObject) and img.is_type(b"igImage"):
+                base = extract_image(reader, img)
+        elif fi.short_name == b"ObjectRefArray" and isinstance(val, (bytes, bytearray)):
+            raw = bytes(val)
+            for i in range(0, len(raw) - 3, 4):
+                ix = struct.unpack_from("<i", raw, i)[0]
+                if 0 <= ix < len(reader.objects):
+                    img = reader.objects[ix]
+                    if isinstance(img, IGBObject) and img.is_type(b"igImage"):
+                        pi = extract_image(reader, img)
+                        if pi is not None:
+                            faces.append(pi)
+    if not faces and base is None:
+        return None
+    return {'faces': faces, 'base': base}
+
+
 def extract_image(reader, image_obj):
     """Extract image data from an igImage object.
 

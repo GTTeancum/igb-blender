@@ -1296,6 +1296,14 @@ def _build_finger_maps(armature_obj, full_fingers=False):
     dup_members = defaultdict(list)  # (side, finger) -> [(bone, stripped_key)]
     chain_letters = {}  # (side, finger) -> scheme letter ('a'-'e') or absent
     for bone in armature_obj.data.bones:
+        # Blender's FBX importer appends zero-length '<name>_end' leaves to
+        # every chain tip. They are NOT finger segments — letting them join a
+        # chain inflates its depth and steals segment slots (the real
+        # 'Finger11' loses Finger1_1 to 'Finger11_end'), which scrambles the
+        # full-finger skeleton and, through the stored bone table, the whole
+        # round-tripped rig. Skip them; the ancestor fallback merges them.
+        if bone.name.lower().endswith('_end'):
+            continue
         norm_low = _normalize_bone_name(bone.name).lower()
         hit = _bone_tables.classify_finger(norm_low)
         if hit is None:
@@ -1713,6 +1721,26 @@ def _fit_skeleton_to_native(armature_obj, target_game='XML2', operator=None):
     if not deltas:
         return
 
+    # Bones the native table doesn't know (the full-finger hand's 30
+    # Bip01_{S}_Finger{0-4}_{0-2} chains) inherit the delta of their nearest
+    # fitted ancestor — the whole chain rides rigidly with its Hand. Without
+    # this the fit moved the Hand but left the fingers (and their weighted
+    # mesh) behind, tearing the wrist — which is why full-finger conversions
+    # used to skip the fit entirely (and then round-tripped as a scrambled
+    # NON-native skeleton: arms reconstructed at leg height).
+    inherited = {}
+    for bone in armature_obj.data.bones:
+        if bone.name in deltas:
+            continue
+        parent = bone.parent
+        while parent is not None:
+            d = deltas.get(parent.name)
+            if d is not None:
+                inherited[bone.name] = d
+                break
+            parent = parent.parent
+    deltas.update(inherited)
+
     # ---- Warp mesh vertices (and shape keys) ----
     for mesh_obj in _get_skinned_meshes(armature_obj):
         mesh = mesh_obj.data
@@ -1776,6 +1804,14 @@ def _fit_skeleton_to_native(armature_obj, target_game='XML2', operator=None):
         direction = eb.tail - eb.head
         eb.head = target
         eb.tail = target + direction
+    # inherited bones (full-finger chains) shift rigidly by their ancestor's
+    # delta, keeping their pose relative to the moved Hand
+    for name, d in inherited.items():
+        eb = edit_bones.get(name)
+        if eb is None:
+            continue
+        eb.head = eb.head + d
+        eb.tail = eb.tail + d
     bpy.ops.object.mode_set(mode='OBJECT')
 
     if operator is not None:
@@ -2000,6 +2036,12 @@ def _detect_source_pose(armature_obj, rename_map=None):
         if arm_dir.length < 0.0001:
             continue
 
+        # Measure in WORLD space — Max/FBX armatures carry a 90°X object
+        # rotation, so a 44°-drooped arm reads ~0° in local space and the
+        # A-pose goes undetected (no repose -> the native fit shears the
+        # still-drooped arm into a zigzag).
+        arm_dir = armature_obj.matrix_world.to_quaternion() @ arm_dir
+
         # Elevation angle from horizontal (XY plane in Blender Z-up)
         horizontal_len = math.sqrt(arm_dir.x ** 2 + arm_dir.y ** 2)
         elevation = math.degrees(math.atan2(abs(arm_dir.z), horizontal_len))
@@ -2069,6 +2111,9 @@ def _repose_meshes(armature_obj, source_pose, target_pose):
         if arm_dir.length < 0.0001:
             continue
 
+        # WORLD space (rotated FBX armature objects — see _detect_source_pose)
+        arm_dir = armature_obj.matrix_world.to_quaternion() @ arm_dir
+
         horizontal_len = math.sqrt(arm_dir.x ** 2 + arm_dir.y ** 2)
         elevation = math.atan2(arm_dir.z, horizontal_len)  # radians, negative = downward
         arm_bones_info.append((upper_name, elevation, side))
@@ -2126,18 +2171,22 @@ def _repose_meshes(armature_obj, source_pose, target_pose):
         # The arm points outward (roughly ±Y). We want to pitch it up/down.
         # Rotation axis = arm direction cross up vector = forward/back axis.
         bone = armature_obj.data.bones[upper_name]
-        arm_dir = bone.tail_local - bone.head_local
+        # WORLD space throughout: the up vector must be world-up, and the
+        # axis conversion must include the armature OBJECT rotation (Max/FBX
+        # rigs are rotated 90°X at the object level).
+        obj_rot = armature_obj.matrix_world.to_quaternion().to_matrix()
+        arm_dir = obj_rot @ (bone.tail_local - bone.head_local)
         arm_dir.normalize()
 
-        # Cross with up vector to get rotation axis
+        # Cross with world up to get the pitch axis
         up = Vector((0, 0, 1))
         rot_axis = arm_dir.cross(up)
         if rot_axis.length < 0.0001:
             continue
         rot_axis.normalize()
 
-        # Convert to bone-local rotation axis
-        bone_mat = bone.matrix_local.to_3x3()
+        # Convert the world axis into bone-local space (object rot included)
+        bone_mat = obj_rot @ bone.matrix_local.to_3x3()
         try:
             local_axis = bone_mat.inverted() @ rot_axis
         except ValueError:
@@ -2181,6 +2230,22 @@ def _apply_current_pose_to_meshes(armature_obj):
         if arm_mod is None:
             continue
 
+        # Pose matrices live in ARMATURE space but vert.co is MESH-local.
+        # FBX rigs often parent the mesh with an inverse that cancels the
+        # armature's 90°X object rotation (mesh world = identity, armature
+        # world = rotated) — applying armature-space rotations directly to
+        # mesh coords then rotates about the wrong axis and smears the limbs
+        # into blades. Conjugate by the relative transform; identity when the
+        # frames already match (every previously-working rig).
+        try:
+            to_arm = armature_obj.matrix_world.inverted() @ child.matrix_world
+            to_mesh = to_arm.inverted()
+        except ValueError:
+            to_arm = Matrix.Identity(4)
+            to_mesh = Matrix.Identity(4)
+        frames_differ = any(abs(to_arm[r][c] - (1.0 if r == c else 0.0)) > 1e-6
+                            for r in range(4) for c in range(4))
+
         # Precompute per-bone transform: pose_bone.matrix @ rest_bone.matrix_local.inverted()
         bone_transforms = {}
         for pb in armature_obj.pose.bones:
@@ -2189,7 +2254,10 @@ def _apply_current_pose_to_meshes(armature_obj):
                 rest_inv = bone.matrix_local.inverted()
             except ValueError:
                 rest_inv = Matrix.Identity(4)
-            bone_transforms[pb.name] = pb.matrix @ rest_inv
+            bt = pb.matrix @ rest_inv
+            if frames_differ:
+                bt = to_mesh @ bt @ to_arm
+            bone_transforms[pb.name] = bt
 
         # Precompute per-vertex weighted rotation (for shape key offsets)
         # and deformed positions (for base mesh)
@@ -2317,6 +2385,7 @@ def _pose_match_native_bind(armature_obj, target_game='XML2'):
         native_pos[name] = game_to_arm @ Vector(p_game)
 
     target_dirs = {}
+    chain_child = dict(_NATIVE_CHAIN_CHILD)
     for bone_name, child_name in _NATIVE_CHAIN_CHILD.items():
         a = native_pos.get(bone_name)
         b = native_pos.get(child_name)
@@ -2325,6 +2394,41 @@ def _pose_match_native_bind(armature_obj, target_game='XML2'):
         d = b - a
         if d.length > 1e-6:
             target_dirs[bone_name] = d.normalized()
+
+    # FULL-FINGER rigs (Bip01_{S}_Finger{0-4}_{0-2}) have no native positions,
+    # so without these aliases the Hand's chain child ('Bip01 {S} Finger1') is
+    # missing and the hand NEVER rotates — the whole hand+fingers keep the
+    # source's drooping curl while the arm straightens (blade-hands), and the
+    # droop bakes against the native-oriented bind. Align the Hand via the
+    # middle-finger proximal, and straighten each finger chain along the
+    # native thumb/finger directions.
+    bones = armature_obj.data.bones
+    for s in ('L', 'R'):
+        if f'Bip01_{s}_Finger2_0' not in bones:
+            continue
+        hand = f'Bip01 {s} Hand'
+        if f'Bip01 {s} Finger1' not in bones:
+            chain_child[hand] = f'Bip01_{s}_Finger2_0'
+        t_thumb = None
+        t_fing = None
+        a, b = native_pos.get(f'Bip01 {s} Finger0'), \
+            native_pos.get(f'Bip01 {s} Finger01')
+        if a is not None and b is not None and (b - a).length > 1e-6:
+            t_thumb = (b - a).normalized()
+        a, b = native_pos.get(f'Bip01 {s} Finger1'), \
+            native_pos.get(f'Bip01 {s} Finger11')
+        if a is not None and b is not None and (b - a).length > 1e-6:
+            t_fing = (b - a).normalized()
+        for col in range(5):
+            tdir = t_thumb if col == 0 else t_fing
+            if tdir is None:
+                continue
+            for seg in (0, 1):
+                bn = f'Bip01_{s}_Finger{col}_{seg}'
+                cn = f'Bip01_{s}_Finger{col}_{seg + 1}'
+                if bn in bones and cn in bones:
+                    target_dirs[bn] = tdir
+                    chain_child[bn] = cn
 
     if not target_dirs:
         return
@@ -2358,7 +2462,9 @@ def _pose_match_native_bind(armature_obj, target_game='XML2'):
         tdir = target_dirs.get(pb.name)
         if tdir is None:
             continue
-        child_pb = armature_obj.pose.bones.get(_NATIVE_CHAIN_CHILD[pb.name])
+        child_name = chain_child.get(pb.name)
+        child_pb = (armature_obj.pose.bones.get(child_name)
+                    if child_name else None)
         if child_pb is None:
             continue
 
@@ -2653,6 +2759,14 @@ def convert_rig(armature_obj, profile='AUTO', auto_scale=True, target_height=68.
     reverse_rename = {v: k for k, v in rename_map.items()}
     _merge_vertex_weights(armature_obj, merge_map, reverse_rename)
 
+    # ---- 3b. Weight verts the SOURCE left unskinned ----
+    # Game rips often ship rigid accessory geometry with NO weights (the
+    # X-Men '97 Cyclops leaves 11% of verts — visor etc. — unweighted). In
+    # XML2/MUA those verts would stay frozen at bind pose while the body
+    # moves. Copy each unweighted vert's weights from its nearest WEIGHTED
+    # vertex so accessories follow the body part they sit on.
+    _fix_unweighted_verts(armature_obj)
+
     # ---- 4. Rename vertex groups on all child meshes BEFORE bone rename ----
     # (vertex groups reference bones by name)
     _rename_vertex_groups(armature_obj, rename_map)
@@ -2871,7 +2985,14 @@ def convert_rig(armature_obj, profile='AUTO', auto_scale=True, target_height=68.
         bpy.ops.object.mode_set(mode='OBJECT')
         print("[IGB Rig Converter] Keep Current Pose: no reposing, no "
               "native-biped fit — exporting the model's imported pose as-is")
-    elif target_pose == 'T_POSE' and align_pose:
+    elif target_pose == 'T_POSE' and (align_pose
+                                      or (source_pose != 'UNKNOWN'
+                                          and source_pose != 'T_POSE')):
+        # A-posed source, T-pose target: use the universal chain-direction
+        # pose-match — per-bone rotations toward the native bind, object-
+        # rotation aware, proven across rig families. The cruder single-axis
+        # _repose_meshes swept rotated-object FBX arms out of plane (zigzag
+        # blades on the X-Men '97 Cyclops).
         _pose_match_native_bind(armature_obj, target_game=target_game)
     elif source_pose != 'UNKNOWN' and source_pose != target_pose:
         _repose_meshes(armature_obj, source_pose, target_pose)
@@ -2894,14 +3015,13 @@ def convert_rig(armature_obj, profile='AUTO', auto_scale=True, target_height=68.
     # horizontal — silently undoing the A-pose (the long-standing "A-pose
     # setup does nothing" bug). A_POSE therefore always keeps the model's
     # own skeleton/proportions (KEEP behaviour), regardless of skeleton_mode.
-    if full_fingers:
-        # Native-fit targets only the reduced biped (no full-finger positions),
-        # so it would move the Hand but leave the 5-finger bones behind, tearing
-        # the wrist. Keep the source's self-consistent hand+body proportions;
-        # MUA's combiner retargets animation onto the exported skeleton anyway.
-        print("[IGB Rig Converter] Full fingers (MUA): skipping native-biped "
-              "fit to preserve the 5-finger hand geometry")
-    elif skeleton_mode == 'NATIVE' and target_pose == 'T_POSE':
+    # Full-finger rigs USED to skip the fit (no native full-finger positions →
+    # the Hand moved but the fingers stayed → wrist tear). That left the whole
+    # skeleton NON-native, and the export/reimport round-trip reconstructs
+    # non-native skeletons wrongly (arms at leg height, no T-pose). The fit
+    # now carries unfitted bones rigidly with their nearest fitted ancestor
+    # (fingers ride the Hand), so it is safe — and necessary — for both modes.
+    if skeleton_mode == 'NATIVE' and target_pose == 'T_POSE':
         _fit_skeleton_to_native(armature_obj, target_game=target_game)
     elif skeleton_mode == 'NATIVE' and target_pose == 'A_POSE':
         print("[IGB Rig Converter] A-pose target: skipping native-biped fit "
@@ -2910,11 +3030,18 @@ def convert_rig(armature_obj, profile='AUTO', auto_scale=True, target_height=68.
     # ---- 8. Compute inverse joint matrices from rest pose ----
     # T-pose target: use hardcoded NATIVE_BONE_ROTATIONS (animation compat)
     # A-pose target: compute rotations from actual bone orientations
+    # Pass the ACTUAL target table explicitly — igb_target_game isn't stamped
+    # on the armature yet, and the default resolver would fall back to the
+    # reduced XML2 table (the full-finger bm-shift bug).
     use_native = (target_pose == 'T_POSE')
-    inv_matrices = _compute_inv_joint_matrices(armature_obj, use_native)
+    export_skeleton = get_skeleton_for_game(target_game,
+                                            full_fingers=full_fingers)
+    inv_matrices = _compute_inv_joint_matrices(armature_obj, use_native,
+                                               skeleton=export_skeleton)
 
     # ---- 9. Compute bone translations ----
-    translations = _compute_bone_translations(armature_obj, use_native)
+    translations = _compute_bone_translations(armature_obj, use_native,
+                                              skeleton=export_skeleton)
 
     # ---- 9b. Force non-deforming root bones to native translations ----
     # Bip01 Z must be exactly ~41.82 game units for correct menu placement,
@@ -3390,6 +3517,60 @@ def _merge_vertex_weights(armature_obj, merge_map, reverse_rename=None):
                 child.vertex_groups.remove(src_vg)
 
 
+def _fix_unweighted_verts(armature_obj, weight_eps=0.01):
+    """Weight source-unskinned verts like their nearest WEIGHTED vertex.
+
+    Game rips often leave rigid accessory geometry (visors, belts, armour
+    plates) with no skin weights — their engine bound the piece some other
+    way. In XML2/MUA an unweighted vert stays frozen at bind pose while the
+    body animates. For each such vert, copy the vertex-group weights of the
+    spatially nearest weighted vertex (KD-tree), so the accessory follows
+    whatever body part it sits on. No-op on fully weighted meshes.
+
+    Returns the number of vertices fixed (for reporting).
+    """
+    from mathutils import kdtree
+
+    fixed = 0
+    for child in _get_skinned_meshes(armature_obj):
+        mesh = child.data
+        weighted_idx = []
+        unweighted_idx = []
+        for v in mesh.vertices:
+            if any(g.weight > weight_eps for g in v.groups):
+                weighted_idx.append(v.index)
+            else:
+                unweighted_idx.append(v.index)
+        if not unweighted_idx or not weighted_idx:
+            continue
+
+        kd = kdtree.KDTree(len(weighted_idx))
+        for i, vi in enumerate(weighted_idx):
+            kd.insert(mesh.vertices[vi].co, vi)
+        kd.balance()
+
+        # source vert -> [(group_index, weight), ...] snapshot BEFORE writes
+        donor_groups = {}
+        for vi in weighted_idx:
+            donor_groups[vi] = [(g.group, g.weight)
+                                for g in mesh.vertices[vi].groups
+                                if g.weight > weight_eps]
+
+        groups = child.vertex_groups
+        for vi in unweighted_idx:
+            _co, donor_vi, _dist = kd.find(mesh.vertices[vi].co)
+            if donor_vi is None:
+                continue
+            for gidx, w in donor_groups.get(donor_vi, ()):
+                if 0 <= gidx < len(groups):
+                    try:
+                        groups[gidx].add([vi], w, 'REPLACE')
+                    except Exception:
+                        pass
+            fixed += 1
+    return fixed
+
+
 # ============================================================================
 # Visual Display
 # ============================================================================
@@ -3525,6 +3706,22 @@ def _compute_bone_rotation_alchemy(bone, game_rot):
     return q_blender
 
 
+def _skeleton_for_armature(armature_obj):
+    """The bone table this armature was converted WITH.
+
+    The per-bone export functions below MUST iterate the same table the
+    armature was built from — iterating the reduced XML2_SKELETON on a
+    full-finger MUA rig skips the 30 finger bones and shifts every bm-index
+    pairing after the L-finger block (R UpperArm receives R Thigh's bind,
+    the hand lands on the floor, tail bones fall off the table entirely).
+    Resolved from the properties convert_rig stamps on the armature."""
+    game = str(armature_obj.get("igb_target_game", "XML2")).upper()
+    if game not in ("XML2", "MUA"):
+        game = "XML2"
+    full = bool(armature_obj.get("igb_full_fingers", False))
+    return get_skeleton_for_game(game, full_fingers=full)
+
+
 def _build_native_bind_matrix(name, bone, game_rot, use_native_rotations=True):
     """Build a bind matrix using native XML2 orientation + custom bone position.
 
@@ -3573,7 +3770,7 @@ def _build_native_bind_matrix(name, bone, game_rot, use_native_rotations=True):
 
 
 def _compute_inv_joint_matrices(armature_obj, use_native_rotations=True,
-                                converted=True):
+                                converted=True, skeleton=None):
     """Compute inverse joint matrices from rotations + custom positions.
 
     For each deforming bone (bm_idx >= 0), builds a bind matrix from:
@@ -3597,12 +3794,14 @@ def _compute_inv_joint_matrices(armature_obj, use_native_rotations=True,
         List of 35 entries (one per XML2 bone), each either a 16-float list
         or None for non-deforming bones.
     """
-    n_bones = len(XML2_SKELETON)
+    if skeleton is None:
+        skeleton = _skeleton_for_armature(armature_obj)
+    n_bones = len(skeleton)
     result = [None] * n_bones
 
     game_rot = _get_game_rotation(armature_obj, converted=converted)
 
-    for name, idx, parent_idx, bm_idx, flags in XML2_SKELETON:
+    for name, idx, parent_idx, bm_idx, flags in skeleton:
         if bm_idx < 0:
             continue
 
@@ -3631,7 +3830,7 @@ def _compute_inv_joint_matrices(armature_obj, use_native_rotations=True,
 
 
 def _compute_bone_translations(armature_obj, use_native_rotations=True,
-                               converted=True):
+                               converted=True, skeleton=None):
     """Compute bone translations (parent-local offsets) from custom positions.
 
     Alchemy FK reconstructs bone world positions as:
@@ -3649,16 +3848,18 @@ def _compute_bone_translations(armature_obj, use_native_rotations=True,
     Returns:
         List of 35 [x, y, z] lists, indexed by bone index.
     """
-    n_bones = len(XML2_SKELETON)
+    if skeleton is None:
+        skeleton = _skeleton_for_armature(armature_obj)
+    n_bones = len(skeleton)
     result = [[0.0, 0.0, 0.0]] * n_bones
 
     game_rot = _get_game_rotation(armature_obj, converted=converted)
 
     xml2_by_idx = {}
-    for entry_name, entry_idx, entry_parent, entry_bm, entry_flags in XML2_SKELETON:
+    for entry_name, entry_idx, entry_parent, entry_bm, entry_flags in skeleton:
         xml2_by_idx[entry_idx] = (entry_name, entry_parent)
 
-    for name, idx, parent_idx, bm_idx, flags in XML2_SKELETON:
+    for name, idx, parent_idx, bm_idx, flags in skeleton:
         display_name = name if name else "Bone_000"
         bone = armature_obj.data.bones.get(display_name)
         if bone is None:

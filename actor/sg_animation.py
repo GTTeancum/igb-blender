@@ -91,6 +91,12 @@ class ParsedAnimation:
     tracks: List[ParsedAnimationTrack]
     priority: int = 0
     source_obj: Optional[IGBObject] = field(default=None, repr=False)
+    # True when EVERY keyframe of every track is the identity quaternion with
+    # zero translation — an engine-side "hold current pose" clip (e.g. XML2
+    # lunge_loop: the lunge pose carries over from lunge_start; the file
+    # itself contains no pose). Standalone, the honest playback is REST HOLD;
+    # applying it through the bind-delta path scrambles the rig.
+    identity_hold: bool = False
 
 
 def extract_animations(reader, skeleton=None) -> List[ParsedAnimation]:
@@ -208,12 +214,27 @@ def _parse_animation(reader, anim_obj, skeleton=None, enbaya_cache=None) -> Opti
 
     duration_ms = duration_ns / 1_000_000.0
 
+    # Detect identity-hold clips (see ParsedAnimation.identity_hold).
+    identity_hold = bool(tracks)
+    for t in tracks:
+        for kf in t.keyframes:
+            q = kf.quaternion  # WXYZ
+            x = kf.translation
+            if (abs(abs(q[0]) - 1.0) > 0.02 or abs(q[1]) > 0.02
+                    or abs(q[2]) > 0.02 or abs(q[3]) > 0.02
+                    or abs(x[0]) > 0.1 or abs(x[1]) > 0.1 or abs(x[2]) > 0.1):
+                identity_hold = False
+                break
+        if not identity_hold:
+            break
+
     return ParsedAnimation(
         name=name,
         duration_ms=duration_ms,
         tracks=tracks,
         priority=priority,
         source_obj=anim_obj,
+        identity_hold=identity_hold,
     )
 
 
@@ -435,9 +456,14 @@ def _parse_enbaya_source(reader, src_obj, endian, enbaya_cache=None) -> List[Par
             # or sample_rate leads to enormous allocations or endless loops.
             from .enbaya import EnbayaStream as _ES
             _hdr = _ES(blob_data, endian=endian)
+            # sample_rate lower bound is 1, NOT 10 — real game anims ship at
+            # low rates (XML1 01_cyclops power_3 = 8 Hz; ~122 such anims were
+            # silently dropped to their constant-quat fallback, rendering as
+            # frozen garbage poses). The other bounds still reject the
+            # encrypted/obfuscated blobs this guard exists for.
             _header_ok = (
                 _hdr.track_count >= 1 and _hdr.track_count <= 500 and
-                _hdr.sample_rate >= 10 and _hdr.sample_rate <= 240 and
+                _hdr.sample_rate >= 1 and _hdr.sample_rate <= 240 and
                 _hdr.duration >= 0.01 and _hdr.duration <= 300 and
                 _hdr.quantization_error >= 1e-6 and
                 _hdr.quantization_error <= 0.5

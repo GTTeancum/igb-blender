@@ -60,40 +60,79 @@ def _quantize_numpy(rgba_data, width, height):
         palette[:len(unique_packed), 3] = ((unique_packed >> 24) & 0xFF).astype(np.uint8)
         index_data = inverse.astype(np.uint8)
     else:
-        # Unpack unique colors for median-cut
+        # Unpack unique colors
         unique_colors = np.zeros((len(unique_packed), 4), dtype=np.uint8)
         unique_colors[:, 0] = (unique_packed & 0xFF).astype(np.uint8)
         unique_colors[:, 1] = ((unique_packed >> 8) & 0xFF).astype(np.uint8)
         unique_colors[:, 2] = ((unique_packed >> 16) & 0xFF).astype(np.uint8)
         unique_colors[:, 3] = ((unique_packed >> 24) & 0xFF).astype(np.uint8)
 
-        palette = _median_cut_np(unique_colors, counts, 256)
+        # BIN-AGGREGATE before the heavy work: gradient/photo textures have
+        # MILLIONS of unique colors (a 2048² diffuse took ~25s), but at 256
+        # palette entries colors within a 6-bit/channel cell are
+        # indistinguishable anyway. Median-cut + nearest-search run on the
+        # bin centers (≤ a few 100k) — assignment error ≤ half a cell on an
+        # already-lossy format; images with ≤256 colors never reach here
+        # (exact path above).
+        centers, bin_counts, bin_inverse = _bin_aggregate(
+            unique_colors, counts)
 
-        # Vectorized nearest-color mapping (fast for any size)
-        index_data = _nearest_color_chunked(pixels, palette)
+        palette = _median_cut_np(centers, bin_counts, 256)
+
+        # nearest palette entry per BIN, expanded bins -> uniques -> pixels
+        bin_idx = _nearest_color_chunked(centers, palette)
+        index_data = bin_idx[bin_inverse][inverse].astype(np.uint8)
 
     # Build palette bytes (vectorized)
     return bytes(palette[:256].tobytes()), bytes(index_data)
 
 
+def _bin_aggregate(unique_colors, counts, max_bins=600000):
+    """Aggregate unique colors into coarse color-space bins.
+
+    Starts at 6 bits/channel (error ≤ 2/255 to the bin center) and coarsens
+    until the bin count is manageable. Returns (bin_centers uint8 (B,4),
+    bin_counts, bin_inverse) where bin_inverse maps each input unique color
+    to its bin row.
+    """
+    for shift in (2, 3, 4):
+        q = (unique_colors.astype(np.uint32) >> shift)
+        packed = (q[:, 0] | (q[:, 1] << 8) | (q[:, 2] << 16) | (q[:, 3] << 24))
+        bin_packed, bin_inverse = np.unique(packed, return_inverse=True)
+        if len(bin_packed) <= max_bins or shift == 4:
+            break
+    bin_counts = np.zeros(len(bin_packed), dtype=np.int64)
+    np.add.at(bin_counts, bin_inverse, counts)
+    half = 1 << (shift - 1)
+    centers = np.zeros((len(bin_packed), 4), dtype=np.uint8)
+    for c, sh in ((0, 0), (1, 8), (2, 16), (3, 24)):
+        centers[:, c] = np.minimum(
+            (((bin_packed >> sh) & 0xFF) << shift) + half, 255
+        ).astype(np.uint8)
+    return centers, bin_counts, bin_inverse
+
+
 def _nearest_color_chunked(pixels, palette):
     """Vectorized nearest-palette-color mapping using numpy.
 
-    Processes pixels in chunks to limit memory usage while keeping
-    all computation in fast numpy operations.
+    argmin over squared distance via BLAS: ||x - p||² = ||x||² - 2x·p + ||p||²
+    and ||x||² is constant per pixel, so argmin(-2x·p + ||p||²) suffices — a
+    single matmul per chunk instead of an explicit (chunk, 256, 4) difference
+    tensor. ~20x faster on large inputs.
     """
     n = len(pixels)
     indices = np.empty(n, dtype=np.uint8)
-    pal = palette.astype(np.int32)  # (256, 4)
+    pal = palette.astype(np.float32)                 # (256, 4)
+    neg2_pal_t = (-2.0 * pal.T).copy()               # (4, 256)
+    pal_sq = (pal * pal).sum(axis=1)                 # (256,)
 
-    chunk_size = 8192
+    chunk_size = 65536
     for start in range(0, n, chunk_size):
         end = min(start + chunk_size, n)
-        block = pixels[start:end].astype(np.int32)  # (chunk, 4)
-        # (chunk, 1, 4) - (1, 256, 4) → (chunk, 256, 4)
-        diff = block[:, np.newaxis, :] - pal[np.newaxis, :, :]
-        dist = (diff * diff).sum(axis=2)  # (chunk, 256) — int32, no overflow
-        indices[start:end] = dist.argmin(axis=1).astype(np.uint8)
+        block = pixels[start:end].astype(np.float32)     # (chunk, 4)
+        scores = block @ neg2_pal_t                      # (chunk, 256) BLAS
+        scores += pal_sq
+        indices[start:end] = scores.argmin(axis=1).astype(np.uint8)
 
     return indices
 
@@ -353,7 +392,24 @@ def map_rgba_to_palette(rgba_data, width, height, palette_data):
     if _HAS_NUMPY:
         pixels = np.frombuffer(rgba_data, dtype=np.uint8).reshape(-1, 4)
         palette = np.frombuffer(palette_data, dtype=np.uint8).reshape(256, 4)
-        return bytes(_nearest_color_chunked(pixels, palette))
+        # search unique colors only, expand via inverse (see _quantize_numpy)
+        packed = (pixels[:, 0].astype(np.uint32) |
+                  (pixels[:, 1].astype(np.uint32) << 8) |
+                  (pixels[:, 2].astype(np.uint32) << 16) |
+                  (pixels[:, 3].astype(np.uint32) << 24))
+        unique_packed, inverse = np.unique(packed, return_inverse=True)
+        uniq = np.zeros((len(unique_packed), 4), dtype=np.uint8)
+        uniq[:, 0] = (unique_packed & 0xFF).astype(np.uint8)
+        uniq[:, 1] = ((unique_packed >> 8) & 0xFF).astype(np.uint8)
+        uniq[:, 2] = ((unique_packed >> 16) & 0xFF).astype(np.uint8)
+        uniq[:, 3] = ((unique_packed >> 24) & 0xFF).astype(np.uint8)
+        if len(uniq) > 4096:
+            counts1 = np.ones(len(uniq), dtype=np.int64)
+            centers, _bc, bin_inverse = _bin_aggregate(uniq, counts1)
+            bin_idx = _nearest_color_chunked(centers, palette)
+            return bytes(bin_idx[bin_inverse][inverse].astype(np.uint8))
+        uniq_idx = _nearest_color_chunked(uniq, palette)
+        return bytes(uniq_idx[inverse].astype(np.uint8))
     return _map_pure(rgba_data, width, height, palette_data)
 
 

@@ -30,13 +30,21 @@ import os
 import time
 
 
-def export_igb(context, filepath, operator=None):
+def export_igb(context, filepath, operator=None, objects=None,
+               bake_transforms=False):
     """Export all scene meshes as a standalone IGB file.
 
     Args:
         context: Blender context
         filepath: output .igb file path
         operator: the export operator (for options and error reporting)
+        objects: optional explicit list of mesh objects to export INSTEAD of
+            scanning the scene (used by Export Mannequin — meshes are read
+            through the evaluated depsgraph, so armature poses bake in)
+        bake_transforms: when True, bake each object's world matrix into its
+            geometry (so a mesh with a non-identity object transform — e.g. an
+            FBX prop — exports correctly oriented/placed). Default False keeps
+            the map exporter's historical local-space behavior byte-identical.
 
     Returns:
         {'FINISHED'} or {'CANCELLED'}
@@ -81,6 +89,20 @@ def export_igb(context, filepath, operator=None):
             _report(operator, 'INFO',
                     f"Texture resolution cap: {max_texture_size}px on longest edge")
 
+    # Normal/spec/gloss role maps (MUA only — reads the same per-material
+    # wiring as the Actor tab: the .IGB Material group or a raw BSDF). Each is
+    # an independent EXPORT toggle so the user can drop any of them.
+    use_normal_maps = bool(getattr(operator, 'use_normal_maps', False))
+    use_specular_maps = bool(getattr(operator, 'use_specular_maps',
+                                     use_normal_maps))
+    use_gloss_map = bool(getattr(operator, 'use_gloss_map', False))
+    normal_y_flip = bool(getattr(operator, 'normal_y_flip', True))
+    if texture_mode == 'clut' or not swap_rb:
+        # Role maps are an MUA DXT5 feature; XML2/CLUT paths have none.
+        use_normal_maps = False
+        use_specular_maps = False
+        use_gloss_map = False
+
     # Build set of objects to EXCLUDE from visual export:
     # 1. "Colliders" collection (collision-only geometry)
     # 2. Any collection prefixed with "[MapMaker]" (editor-only objects)
@@ -115,13 +137,17 @@ def export_igb(context, filepath, operator=None):
             if obj.type == 'MESH':
                 collider_objects.add(obj)
 
-    # Collect all VISIBLE mesh objects EXCLUDING colliders, [MapMaker], and hidden objects
-    mesh_objects = [
-        obj for obj in context.scene.objects
-        if obj.type == 'MESH'
-        and obj not in excluded_objects
-        and not obj.hide_viewport
-    ]
+    # Collect all VISIBLE mesh objects EXCLUDING colliders, [MapMaker], and
+    # hidden objects — or use the explicit list when one was provided.
+    if objects is not None:
+        mesh_objects = [obj for obj in objects if obj.type == 'MESH']
+    else:
+        mesh_objects = [
+            obj for obj in context.scene.objects
+            if obj.type == 'MESH'
+            and obj not in excluded_objects
+            and not obj.hide_viewport
+        ]
 
     if not mesh_objects:
         _report(operator, 'ERROR',
@@ -149,7 +175,9 @@ def export_igb(context, filepath, operator=None):
         _report(operator, 'INFO', f"  Object '{obj.name}':")
 
         try:
-            submeshes = extract_mesh_per_material(obj, uv_v_flip=True)
+            wm = obj.matrix_world if bake_transforms else None
+            submeshes = extract_mesh_per_material(obj, uv_v_flip=True,
+                                                  world_matrix=wm)
         except ValueError as e:
             _report(operator, 'WARNING',
                     f"    Skipping '{obj.name}': {e}")
@@ -179,10 +207,45 @@ def export_igb(context, filepath, operator=None):
             else:
                 material_props = _default_material()
 
-            # Extract and compress texture(s) (with caching)
-            # Check for multi-texture (normal map, specular map)
-            all_tex_images = _find_all_texture_images(bl_mat)
-            has_extra_textures = len(all_tex_images) > 1
+            # Extract and compress texture(s) (with caching).
+            # Role maps (normal/spec/gloss) read the SAME per-material wiring
+            # as the Actor tab — skin_export._find_role_image handles both
+            # the .IGB Material group and a raw Principled BSDF — and honor
+            # the per-material igb_use_* toggles (default on). MUA units:
+            # 0=diffuse, 1=normal, 2=specular, 5=gloss/mask.
+            role_stages = []
+            if bl_mat is not None and (use_normal_maps or use_specular_maps
+                                       or use_gloss_map):
+                from .skin_export import _find_role_image
+
+                def _map_on(attr):
+                    return bool(getattr(bl_mat, attr, True))
+
+                role_defs = []
+                if use_normal_maps and _map_on('igb_use_normal_map'):
+                    role_defs.append(('normal', 1))
+                if use_specular_maps and _map_on('igb_use_specular_map'):
+                    role_defs.append(('specular', 2))
+                if use_gloss_map and _map_on('igb_use_gloss_map'):
+                    role_defs.append(('gloss', 5))
+                for role, unit_id in role_defs:
+                    role_img = _find_role_image(bl_mat, role)
+                    if role_img is None:
+                        continue
+                    tex_levels, tex_name = _get_texture_for_image(
+                        role_img, texture_cache, operator,
+                        swap_rb=swap_rb, role=role,
+                        normal_y_flip=normal_y_flip,
+                        max_texture_size=max_texture_size,
+                    )
+                    if tex_levels is None:
+                        # e.g. a non-normal image on the Normal input was
+                        # skipped (warned above) — don't emit an empty stage.
+                        continue
+                    role_stages.append((tex_levels, tex_name, unit_id))
+                    _report(operator, 'INFO',
+                            f"      Texture stage {unit_id} ({role}): "
+                            f"{tex_name}")
 
             if texture_mode == 'clut':
                 # CLUT mode: only supports single diffuse texture
@@ -198,28 +261,21 @@ def export_igb(context, filepath, operator=None):
                     'texture_levels': None,
                     'texture_name': texture_name,
                 })
-            elif has_extra_textures:
-                # Multi-texture path: build texture_stages list
-                texture_stages = []
-                for unit_id in sorted(all_tex_images.keys()):
-                    bl_image = all_tex_images[unit_id]
-                    # Normal maps (unit_id=1): flip green channel back to DirectX
-                    is_nmap = (unit_id == 1)
-                    tex_levels, tex_name = _get_texture_for_image(
-                        bl_image, texture_cache, operator,
-                        swap_rb=swap_rb, flip_green=is_nmap,
-                        max_texture_size=max_texture_size,
-                    )
-                    texture_stages.append((tex_levels, tex_name, unit_id))
-                    _report(operator, 'INFO',
-                            f"      Texture stage {unit_id}: {tex_name}"
-                            f"{' (normal map)' if is_nmap else ''}")
-
+            elif role_stages:
+                # Multi-texture path: diffuse on unit 0 + the role maps.
+                # normal_mapped makes the builder emit the tangent-frame
+                # vertex streams MUA's bump shader needs.
+                texture_levels, texture_name = _get_texture_for_material(
+                    bl_mat, texture_cache, operator, swap_rb=swap_rb,
+                    max_texture_size=max_texture_size,
+                )
                 builder_submeshes.append({
                     'mesh': sub_mesh,
                     'material': material_props,
                     'material_state': material_props.get('material_state', {}),
-                    'texture_stages': texture_stages,
+                    'texture_stages': ([(texture_levels, texture_name, 0)]
+                                       + role_stages),
+                    'normal_mapped': any(u == 1 for _, _, u in role_stages),
                 })
             else:
                 # Single-texture path (most common)
@@ -240,6 +296,20 @@ def export_igb(context, filepath, operator=None):
         _report(operator, 'ERROR',
                 "No valid mesh data found in scene objects.")
         return {'CANCELLED'}
+
+    # Honor the Mipmaps toggle: drop every texture to its base level (~33%
+    # smaller). Same trim the skin exporter does.
+    use_mipmaps = bool(getattr(operator, 'use_mipmaps', True))
+    if not use_mipmaps:
+        for sub in builder_submeshes:
+            lv = sub.get('texture_levels')
+            if lv:
+                sub['texture_levels'] = lv[:1]
+            stages = sub.get('texture_stages')
+            if stages:
+                sub['texture_stages'] = [
+                    ((levels[:1] if levels else levels), name, unit)
+                    for (levels, name, unit) in stages]
 
     _report(operator, 'INFO',
             f"  Total: {total_objects} objects, {total_submeshes} submeshes")
@@ -543,17 +613,21 @@ def _get_texture_for_material(bl_mat, texture_cache, operator, swap_rb=False,
 
 
 def _get_texture_for_image(bl_image, texture_cache, operator, swap_rb=False,
-                           flip_green=False, max_texture_size=0):
+                           role=None, normal_y_flip=True, max_texture_size=0):
     """Get compressed texture levels for a specific Blender image, using cache.
 
-    Like _get_texture_for_material but takes a bl_image directly (for multi-texture).
+    Like _get_texture_for_material but takes a bl_image directly (for
+    multi-texture role maps).
 
     Args:
         bl_image: Blender image to compress
         texture_cache: dict for caching compressed textures
         operator: Blender operator for reporting
         swap_rb: swap R/B channels (MUA PC)
-        flip_green: flip green channel (OpenGL → DirectX normal map conversion)
+        role: 'normal' repacks into MUA's DXT5nm layout (X→alpha, Y→green,
+            auto-detecting blue tangent-space vs already-DXT5nm sources —
+            same conversion the skin exporter uses); other roles pass through
+        normal_y_flip: flip normal green OpenGL→DirectX during the repack
         max_texture_size: 0 = keep original size; otherwise cap longest edge.
 
     Returns:
@@ -564,10 +638,12 @@ def _get_texture_for_image(bl_image, texture_cache, operator, swap_rb=False,
     texture_levels = None
     texture_name = bl_image.name if bl_image is not None else ''
 
-    # Include flip_green and cap size in cache key so variants stay separate
-    cache_key = f"{texture_name}@{max_texture_size}"
-    if flip_green:
-        cache_key = cache_key + '_nmap'
+    # Cache key MUST include the role: the diffuse path (_get_texture_for_material)
+    # keys on "name@size" too, so a specular/gloss image that shares a Blender
+    # image name with the diffuse would otherwise fetch the diffuse's bytes.
+    cache_key = f"{texture_name}@{max_texture_size}@{role or 'diffuse'}"
+    if role == 'normal' and normal_y_flip:
+        cache_key = cache_key + '_yflip'
 
     if bl_image is not None:
         # Check cache first
@@ -587,14 +663,22 @@ def _get_texture_for_image(bl_image, texture_cache, operator, swap_rb=False,
             img_w, img_h, rgba_data = _ensure_power_of_2(
                 img_w, img_h, rgba_data)
 
-            # Flip green channel for normal maps (OpenGL → DirectX)
-            if flip_green:
-                # rgba_data is bytes (immutable) after _ensure_power_of_2 —
-                # convert to bytearray so we can mutate in place.
-                rgba_data = bytearray(rgba_data)
-                for i in range(len(rgba_data) // 4):
-                    rgba_data[i * 4 + 1] = 255 - rgba_data[i * 4 + 1]
-                rgba_data = bytes(rgba_data)
+            # Normal maps: repack into MUA's DXT5nm channel layout (the
+            # naive green-flip alone leaves X in RED where the Cg bump
+            # shader never looks — it reads X from ALPHA, Y from GREEN).
+            # Guard against a colour/grayscale map mis-wired onto the Normal
+            # input (would become green-black); warn + skip instead.
+            if role == 'normal':
+                from .skin_export import (convert_normal_rgba_to_mua,
+                                          looks_like_normal_map)
+                if not looks_like_normal_map(rgba_data):
+                    _report(operator, 'WARNING',
+                            f"      '{texture_name}' on the Normal input isn't a "
+                            f"normal map (colour/grayscale) — skipping it; wire a "
+                            f"specular/gloss map to its own input instead")
+                    return None, texture_name
+                rgba_data = bytes(convert_normal_rgba_to_mua(
+                    bytearray(rgba_data), normal_y_flip=normal_y_flip))
 
             # DXT5 compress with mipmaps
             try:
@@ -603,7 +687,7 @@ def _get_texture_for_image(bl_image, texture_cache, operator, swap_rb=False,
                 _report(operator, 'INFO',
                         f"      Compressed: {img_w}x{img_h}, "
                         f"{len(texture_levels)} mip levels"
-                        f"{' (normal map G-flip)' if flip_green else ''}")
+                        f"{' (MUA DXT5nm)' if role == 'normal' else ''}")
                 texture_cache[cache_key] = (texture_levels, texture_name)
             except Exception as e:
                 _report(operator, 'WARNING',
@@ -916,93 +1000,17 @@ def _extract_material_state(bl_mat):
 
 
 def _find_texture_image(bl_mat):
-    """Find the first Image Texture connected to a Principled BSDF.
+    """Find the DIFFUSE (base colour) image for a material.
 
-    First checks for a texture directly linked to the Base Color input.
-    Falls back to any Image Texture node in the material.
+    Robust to the .IGB Material node group: checks the group's 'Base Texture'
+    input and a raw BSDF 'Base Color' first, so it never grabs the normal/
+    specular/gloss map by falling through to "any texture node" (the bug where
+    the normal map became the main texture after Convert-to-IGB).
     """
-    if not bl_mat.use_nodes:
+    if bl_mat is None or not bl_mat.use_nodes or bl_mat.node_tree is None:
         return None
-
-    # Check Principled BSDF Base Color input
-    for node in bl_mat.node_tree.nodes:
-        if node.type == 'BSDF_PRINCIPLED':
-            base_color = node.inputs.get('Base Color')
-            if base_color is not None and base_color.is_linked:
-                for link in base_color.links:
-                    from_node = link.from_node
-                    if from_node.type == 'TEX_IMAGE' and from_node.image is not None:
-                        return from_node.image
-            break
-
-    # Fallback: any Image Texture node
-    for node in bl_mat.node_tree.nodes:
-        if node.type == 'TEX_IMAGE' and node.image is not None:
-            return node.image
-
-    return None
-
-
-def _find_all_texture_images(bl_mat):
-    """Find all texture images connected to Principled BSDF, classified by role.
-
-    Checks Base Color (diffuse, unit_id=0), Normal (normal, unit_id=1),
-    and Specular IOR Level (specular, unit_id=2) inputs.
-
-    Returns:
-        dict mapping unit_id -> bpy.types.Image, or empty dict if none found.
-        Only contains entries for textures that are actually connected.
-    """
-    if bl_mat is None or not bl_mat.use_nodes:
-        return {}
-
-    bsdf = None
-    for node in bl_mat.node_tree.nodes:
-        if node.type == 'BSDF_PRINCIPLED':
-            bsdf = node
-            break
-    if bsdf is None:
-        return {}
-
-    result = {}
-
-    # unit_id=0: diffuse (Base Color input)
-    base_color = bsdf.inputs.get('Base Color')
-    if base_color is not None and base_color.is_linked:
-        for link in base_color.links:
-            from_node = link.from_node
-            if from_node.type == 'TEX_IMAGE' and from_node.image is not None:
-                result[0] = from_node.image
-                break
-
-    # unit_id=1: normal (Normal input, via Normal Map node)
-    normal_input = bsdf.inputs.get('Normal')
-    if normal_input is not None and normal_input.is_linked:
-        for link in normal_input.links:
-            nmap_node = link.from_node
-            # Normal Map node -> its Color input has the texture
-            if nmap_node.type == 'NORMAL_MAP':
-                color_in = nmap_node.inputs.get('Color')
-                if color_in is not None and color_in.is_linked:
-                    for nlink in color_in.links:
-                        if (nlink.from_node.type == 'TEX_IMAGE' and
-                                nlink.from_node.image is not None):
-                            result[1] = nlink.from_node.image
-                            break
-            # Direct Image Texture -> Normal (unusual but handle it)
-            elif nmap_node.type == 'TEX_IMAGE' and nmap_node.image is not None:
-                result[1] = nmap_node.image
-
-    # unit_id=2: specular (Specular IOR Level input)
-    spec_input = bsdf.inputs.get('Specular IOR Level')
-    if spec_input is not None and spec_input.is_linked:
-        for link in spec_input.links:
-            from_node = link.from_node
-            if from_node.type == 'TEX_IMAGE' and from_node.image is not None:
-                result[2] = from_node.image
-                break
-
-    return result
+    from .skin_export import _find_diffuse_image
+    return _find_diffuse_image(bl_mat)
 
 
 def _extract_image_pixels(bl_image):

@@ -223,14 +223,23 @@ class SceneGraph:
             if hasattr(visitor, 'visit_blend_matrix_select'):
                 visitor.visit_blend_matrix_select(obj, obj)
 
-        # Handle attribute sets
+        # Handle attribute sets.
+        # Alchemy semantics: attributes on an igAttrSet apply to that node and
+        # its SUBTREE only (state is pushed on entry and popped on exit).
+        # Visitors that track material/texture state implement push_state()/
+        # pop_state() so sibling subtrees don't leak state into each other.
+        # State attrs are dispatched BEFORE geometry attrs so a geometry attr
+        # always sees its own node's material state regardless of list order.
+        pushed_state = False
         if obj.is_type(b"igAttrSet"):
             attrs = self._get_attr_list(obj)
+            if attrs and hasattr(visitor, 'push_state'):
+                visitor.push_state()
+                pushed_state = True
             for attr in attrs:
                 if isinstance(attr, IGBObject):
                     if attr.is_type(b"igGeometryAttr") or attr.is_type(b"igGeometryAttr2"):
-                        if hasattr(visitor, 'visit_geometry_attr'):
-                            visitor.visit_geometry_attr(attr, local_transform, obj)
+                        continue  # dispatched after state attrs below
                     elif attr.is_type(b"igMaterialAttr"):
                         if hasattr(visitor, 'visit_material_attr'):
                             visitor.visit_material_attr(attr, obj)
@@ -264,6 +273,13 @@ class SceneGraph:
                     elif attr.is_type(b"igBlendMatrixSelect"):
                         if hasattr(visitor, 'visit_blend_matrix_select'):
                             visitor.visit_blend_matrix_select(attr, obj)
+            # Second pass: geometry attrs (now that this node's state attrs
+            # have all been applied)
+            for attr in attrs:
+                if isinstance(attr, IGBObject):
+                    if attr.is_type(b"igGeometryAttr") or attr.is_type(b"igGeometryAttr2"):
+                        if hasattr(visitor, 'visit_geometry_attr'):
+                            visitor.visit_geometry_attr(attr, local_transform, obj)
 
         # Handle light set nodes (contain igLightAttr objects)
         if obj.is_type(b"igLightSet"):
@@ -274,6 +290,10 @@ class SceneGraph:
         children = self._get_children(obj)
         for child in children:
             self._visit_node(child, visitor, local_transform, ancestors)
+
+        # Restore state on subtree exit (matches Alchemy's push/pop semantics)
+        if pushed_state and hasattr(visitor, 'pop_state'):
+            visitor.pop_state()
 
         # Track igSegment exit
         if is_segment and hasattr(visitor, 'exit_segment'):

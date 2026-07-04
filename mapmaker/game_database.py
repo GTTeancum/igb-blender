@@ -94,8 +94,53 @@ def _safe_int(val: str) -> int:
         return 0
 
 
+def _read_stat_root(stat_path: Path):
+    """Read a stat file as an ElementTree root, handling BOTH compiled XMLB
+    (.engb — XML2/MUA PC) and plain-text XML (.eng — XML1 console decompiles).
+
+    XML1's npcstat.eng/herostat.eng are the SAME <characters><stats .../>
+    schema as XML2's compiled tables, just uncompiled text, so once we have a
+    root the existing _parse_stats_elements handles either identically.
+    """
+    with open(stat_path, "rb") as f:
+        head = f.read(16)
+    # first non-whitespace byte '<' => plain-text XML. Strip a leading UTF-8
+    # BOM too, else a BOM'd .eng is misrouted to the compiled-XMLB reader and
+    # silently drops the whole table.
+    if head.lstrip(b"\xef\xbb\xbf \t\r\n\x0b\x0c")[:1] == b"<":
+        # plain-text XML (XML1). Game .eng dumps can carry stray/unescaped
+        # bytes or odd encoding declarations, so recover via a lenient tag scan
+        # on ANY strict-parse failure (ParseError, bad-encoding LookupError, …).
+        import xml.etree.ElementTree as ET
+        try:
+            return ET.parse(str(stat_path)).getroot()
+        except Exception:
+            return _lenient_stats_root(stat_path)
+    from .xmlb_compile import decompile_xmlb
+    return decompile_xmlb(stat_path)
+
+
+def _lenient_stats_root(stat_path: Path):
+    """Fallback for malformed plain-text stat XML: synthesize a <characters>
+    root from each `<stats ...>` opening tag via regex, ignoring nested
+    children and unescaped-entity noise that strict ElementTree rejects."""
+    import re
+    import xml.etree.ElementTree as ET
+    text = open(stat_path, encoding="cp1252", errors="replace").read()
+    root = ET.Element("characters")
+    for m in re.finditer(r"<stats\b([^>]*?)/?>", text):
+        el = ET.SubElement(root, "stats")
+        for am in re.finditer(r'([\w]+)\s*=\s*"([^"]*)"', m.group(1)):
+            el.set(am.group(1), am.group(2))
+    return root
+
+
 def load_character_db(game_data_dir: str) -> Dict[str, CharacterInfo]:
-    """Load character database from npcstat.engb + herostat.engb.
+    """Load character database from npcstat + herostat.
+
+    Prefers the compiled English binary tables (npcstat.engb/herostat.engb —
+    XML2/MUA PC) and falls back to the plain-text .eng tables (XML1 console
+    decompiles), which share the same <stats> schema.
 
     Args:
         game_data_dir: Root game data directory (contains data/ subfolder)
@@ -103,22 +148,21 @@ def load_character_db(game_data_dir: str) -> Dict[str, CharacterInfo]:
     Returns:
         dict mapping character name -> CharacterInfo
     """
-    from .xmlb_compile import decompile_xmlb
-
     chars: Dict[str, CharacterInfo] = {}
     data_dir = Path(game_data_dir) / "data"
 
-    for stat_file, source in [("npcstat.engb", "npcstat"), ("herostat.engb", "herostat")]:
-        stat_path = data_dir / stat_file
-        if not stat_path.exists():
-            continue
-
-        try:
-            root = decompile_xmlb(stat_path)
-            parsed = _parse_stats_elements(root, source)
-            chars.update(parsed)
-        except Exception as e:
-            print(f"[MapMaker] Warning: Failed to parse {stat_file}: {e}")
+    for source, candidates in [("npcstat", ["npcstat.engb", "npcstat.eng"]),
+                               ("herostat", ["herostat.engb", "herostat.eng"])]:
+        for fname in candidates:
+            stat_path = data_dir / fname
+            if not stat_path.exists():
+                continue
+            try:
+                root = _read_stat_root(stat_path)
+                chars.update(_parse_stats_elements(root, source))
+            except Exception as e:
+                print(f"[MapMaker] Warning: Failed to parse {fname}: {e}")
+            break  # first existing candidate per source wins
 
     return chars
 

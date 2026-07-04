@@ -726,11 +726,19 @@ def _get_igb_scene_mats(context, selected_only=False, skins_only=False):
     collider_objs = set(colliders_coll.objects) if colliders_coll else set()
 
     if skins_only:
-        actor_props = getattr(context.scene, "igb_actor", None)
-        skin_names = ({item.object_name for item in actor_props.skins}
-                      if actor_props is not None else set())
-        source_objects = [obj for obj in context.scene.objects
-                          if obj.name in skin_names]
+        # Use the actor Materials panel's robust resolver: registered skins,
+        # else the armature's skinned meshes, else the active mesh. This is why
+        # the actor quick tools work even when the skins LIST is empty (an
+        # imported actor whose meshes were never added to props.skins).
+        try:
+            from .actor.panels import _actor_material_meshes
+            source_objects = _actor_material_meshes(context)
+        except Exception:
+            actor_props = getattr(context.scene, "igb_actor", None)
+            skin_names = ({item.object_name for item in actor_props.skins}
+                          if actor_props is not None else set())
+            source_objects = [obj for obj in context.scene.objects
+                              if obj.name in skin_names]
     elif selected_only:
         source_objects = context.selected_objects
     else:
@@ -1388,6 +1396,7 @@ class IGB_PT_ImportExport(Panel):
         col.scale_y = 1.3
         col.operator("import_scene.igz", text="Import IGZ (.igz)", icon='IMPORT')
         col.operator("mm.import_eng", text="Import ENG/ENGB (.engb)", icon='IMPORT')
+        col.operator("mm.import_full_map", text="Import Full Map (.igb)", icon='IMPORT')
 
         # Models folder path (used by ENGB import to load entity IGB files)
         settings = context.scene.mm_settings
@@ -1397,6 +1406,60 @@ class IGB_PT_ImportExport(Panel):
         col.scale_y = 1.3
         col.separator()
         col.operator("export_scene.igb", text="Export IGB (.igb)", icon='EXPORT')
+
+
+# ===========================================================================
+# IGB Log sub-panel
+# ===========================================================================
+
+class IGB_OT_log_copy(bpy.types.Operator):
+    """Copy the full IGB log to the clipboard"""
+    bl_idname = "igb.log_copy"
+    bl_label = "Copy IGB Log"
+
+    def execute(self, context):
+        from .utils.igb_log import as_text
+        context.window_manager.clipboard = as_text()
+        self.report({'INFO'}, "IGB log copied to clipboard")
+        return {'FINISHED'}
+
+
+class IGB_OT_log_clear(bpy.types.Operator):
+    """Clear the IGB log"""
+    bl_idname = "igb.log_clear"
+    bl_label = "Clear IGB Log"
+
+    def execute(self, context):
+        from .utils.igb_log import clear
+        clear()
+        return {'FINISHED'}
+
+
+class IGB_PT_Log(Panel):
+    """Recent import/export messages (copyable — no console digging)"""
+    bl_label = "IGB Log"
+    bl_idname = "IGB_PT_Log"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = "IGB Tools"
+    bl_parent_id = "IGB_PT_Main"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        from .utils.igb_log import entries
+        layout = self.layout
+        row = layout.row(align=True)
+        row.operator("igb.log_copy", icon='COPYDOWN', text="Copy All")
+        row.operator("igb.log_clear", icon='TRASH', text="Clear")
+        items = entries(last=14)
+        if not items:
+            layout.label(text="No messages yet", icon='INFO')
+            return
+        col = layout.column(align=True)
+        icons = {'ERROR': 'CANCEL', 'WARNING': 'ERROR'}
+        for t, lv, m in reversed(items):
+            col.label(text=f"{t}  {m[:64]}",
+                      icon=icons.get(lv, 'DOT'))
 
 
 # ===========================================================================
@@ -1530,19 +1593,35 @@ class IGB_PT_Materials(Panel):
             layout.label(text="No materials on scene meshes", icon='ERROR')
 
 
+def _prev_pow2(n):
+    """Largest power of 2 <= n (min 1)."""
+    p = 1
+    while p * 2 <= n:
+        p *= 2
+    return max(1, p)
+
+
+def _texture_size_items(self, context):
+    """Shared texture-size enum (same as the export operators)."""
+    from .exporter.texture_size import texture_size_items
+    return texture_size_items(self, context)
+
+
 class IGB_OT_resize_textures(Operator):
-    """Resize all textures used by scene materials to 512×512"""
+    """Downscale every scene texture so its longest edge is at most the chosen
+    size, PRESERVING aspect ratio (snapped to power-of-2). Only shrinks —
+    textures already within the cap are left alone. Mutates the images in place
+    (a deliberate pre-bake), so save a copy first if you need the originals"""
     bl_idname = "igb.resize_textures"
-    bl_label = "Resize Textures to 512"
-    bl_description = "Scale all scene textures to 512×512 for game compatibility"
+    bl_label = "Downscale Textures"
+    bl_description = ("Downscale all scene textures to a max longest-edge size "
+                      "(aspect-preserving) to shrink IGB file size")
     bl_options = {'REGISTER', 'UNDO'}
 
-    target_size: IntProperty(
-        name="Size",
-        description="Target texture size (square)",
-        default=512,
-        min=32,
-        max=2048,
+    max_size: EnumProperty(
+        name="Max Texture Size",
+        description="Cap the longest edge of every scene texture to this size",
+        items=_texture_size_items,
     )
 
     def execute(self, context):
@@ -1553,7 +1632,7 @@ class IGB_OT_resize_textures(Operator):
                 continue
             for slot in obj.material_slots:
                 mat = slot.material
-                if mat is None or not mat.use_nodes:
+                if mat is None or not mat.use_nodes or mat.node_tree is None:
                     continue
                 for node in mat.node_tree.nodes:
                     if node.type == 'TEX_IMAGE' and node.image is not None:
@@ -1563,20 +1642,28 @@ class IGB_OT_resize_textures(Operator):
             self.report({'WARNING'}, "No textures found on scene materials")
             return {'FINISHED'}
 
-        sz = self.target_size
+        if self.max_size == 'original':
+            self.report({'INFO'}, "Max = Original: nothing to downscale")
+            return {'FINISHED'}
+        cap = int(self.max_size)
+
         resized = 0
         skipped = 0
-
         for img in images:
-            if img.size[0] == sz and img.size[1] == sz:
+            w, h = img.size[0], img.size[1]
+            if w == 0 or h == 0 or max(w, h) <= cap:
                 skipped += 1
                 continue
-            img.scale(sz, sz)
+            # Longest edge -> cap, other edge scaled proportionally, POT-snapped
+            scale = cap / float(max(w, h))
+            nw = _prev_pow2(max(1, int(round(w * scale))))
+            nh = _prev_pow2(max(1, int(round(h * scale))))
+            img.scale(nw, nh)
             resized += 1
 
         self.report({'INFO'},
-                    f"Resized {resized} texture(s) to {sz}×{sz}"
-                    f" ({skipped} already correct)")
+                    f"Downscaled {resized} texture(s) to ≤{cap}px longest edge"
+                    f" ({skipped} already within cap)")
         return {'FINISHED'}
 
 
@@ -1923,11 +2010,15 @@ class IGB_PT_QT_MaterialColors(Panel):
         # Shininess
         box = layout.box()
         box.label(text="Shininess", icon='SHADING_RENDERED')
-        box.label(text="Specular exponent (0=matte, 128=mirror).")
+        box.label(text="Specular exponent: higher = tighter = less shiny.")
         row = box.row(align=True)
-        op = row.operator("igb.set_all_shininess", text="Matte (0)",
+        op = row.operator("igb.set_all_shininess", text="Soft (native)",
                           icon='MATPLANE')
-        op.shininess = 0.0
+        op.shininess = 1.28
+        op.selected_only = sel
+        op = row.operator("igb.set_all_shininess", text="Less Shiny",
+                          icon='SHADING_RENDERED')
+        op.shininess = 32.0
         op.selected_only = sel
         op = row.operator("igb.set_all_shininess", text="Set Value",
                           icon='COLORSET_01_VEC')
@@ -2360,16 +2451,22 @@ def _draw_material_colors(layout, mat):
         for i, ch in enumerate(("R", "G", "B", "A")):
             col.prop(mat, f'["igb_emission"]', index=i, text=f"Emission {ch}")
 
-        # Shininess
+        # Shininess (specular EXPONENT). Higher = tighter/smaller highlight =
+        # LESS overall shine. Very low (near 0) spreads full specular over the
+        # whole surface = "very shiny". Native MUA = 1.28; raise it to tame a
+        # too-shiny model. To remove specular entirely, untick the Specular map
+        # or set Specular colour to black.
         sub = box.box()
-        sub.label(text="Shininess (specular power, 0-128; 0 = off)")
+        sub.label(text="Shininess (higher = tighter = less shiny)")
         sub.prop(mat, '["igb_shininess"]', text="Shininess", slider=True)
         prow = sub.row(align=True)
         prow.label(text="Presets:")
-        for val, lbl in ((0.0, "Off"), (1.28, "Mild"), (12.8, "Shiny")):
+        for val, lbl in ((1.28, "Soft"), (8.0, "Medium"), (32.0, "Tight")):
             op = prow.operator("igb.set_shininess", text=lbl)
             op.value = val
             op.material_name = mat.name
+        sub.label(text="0 exports as 1.28 (native) — never full-surface shine.",
+                  icon='INFO')
 
         # Flags
         if mat.get("igb_flags") is not None:
@@ -2644,6 +2741,9 @@ classes = (
     # IGB Tab panels (parent before children)
     IGB_PT_Main,
     IGB_PT_ImportExport,
+    IGB_OT_log_copy,
+    IGB_OT_log_clear,
+    IGB_PT_Log,
     IGB_PT_Collision,
     IGB_PT_Materials,
     IGB_PT_QuickTools,

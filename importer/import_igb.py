@@ -47,6 +47,44 @@ class GeometryCollector:
         self._current_lighting_state_obj = None
         self._current_tex_matrix_state_obj = None
         self._current_cull_face_obj = None
+        self._state_stack = []
+
+    def push_state(self):
+        """Save current material state on entry to an igAttrSet subtree.
+
+        Called by SceneGraph.walk() so attributes only apply to the subtree
+        they're defined on (Alchemy push/pop semantics). Without this, state
+        from one subtree leaks into later siblings — on MUA maps (stark1)
+        that gave 180/468 instances the wrong texture set and 411/468 a
+        wrong blend/alpha state (transparent stairs, wrong floor textures).
+        """
+        self._state_stack.append((
+            self._current_material_obj,
+            dict(self._current_texbind_map),
+            self._current_blend_state_obj,
+            self._current_blend_func_obj,
+            self._current_alpha_state_obj,
+            self._current_alpha_func_obj,
+            self._current_color_obj,
+            self._current_lighting_state_obj,
+            self._current_tex_matrix_state_obj,
+            self._current_cull_face_obj,
+        ))
+
+    def pop_state(self):
+        """Restore material state when leaving an igAttrSet subtree."""
+        if not self._state_stack:
+            return
+        (self._current_material_obj,
+         self._current_texbind_map,
+         self._current_blend_state_obj,
+         self._current_blend_func_obj,
+         self._current_alpha_state_obj,
+         self._current_alpha_func_obj,
+         self._current_color_obj,
+         self._current_lighting_state_obj,
+         self._current_tex_matrix_state_obj,
+         self._current_cull_face_obj) = self._state_stack.pop()
 
     def visit_material_attr(self, attr, parent):
         """Called when we encounter an igMaterialAttr in the scene graph."""
@@ -469,12 +507,28 @@ def import_igb(context, filepath, operator=None):
                 if bl_material is not None:
                     obj.data.materials.append(bl_material)
                     materials_created.add(bl_material.name)
+                    # Zone-shadow decals (XML1/XML2 baked shadow overlays,
+                    # textures under Art/Objects/Zone_Shadows/) — tag the
+                    # mesh so every instance gets the decal fixups below.
+                    if any(pt.image is not None and pt.image.name
+                           and 'zone_shadow' in pt.image.name.lower()
+                           for pt in parsed_textures):
+                        obj.data["igb_shadow_decal"] = True
                     # Untextured, vertex-colored geometry (e.g. MUA PC UI
                     # backgrounds like convo_background_select) would render
                     # flat gray otherwise — drive Base Color from the imported
                     # vertex Color attribute when the material has no texture.
                     if geom.has_colors:
                         _wire_vertex_colors_to_material(bl_material, obj)
+
+        # Shadow decals sit exactly ON the floor — lift a hair so they don't
+        # z-fight (the game draws them with depth bias), and keep them from
+        # casting real shadows in EEVEE/Cycles.
+        if obj.data.get("igb_shadow_decal"):
+            m = obj.matrix_world.copy()
+            m.translation.z += 1.0
+            obj.matrix_world = m
+            obj.visible_shadow = False
 
         collection.objects.link(obj)
         created_count += 1
@@ -1324,6 +1378,11 @@ def _import_collision_hulls(reader, basename, context, operator):
         # Create object
         col_obj = bpy.data.objects.new(mesh_name, mesh)
         col_obj.display_type = 'SOLID'
+        # Collision blockout is a viewport editing aid — keep it out of
+        # renders. A full-map hull with the semi-transparent green material
+        # otherwise tints the ENTIRE map green in rendered mode (reported
+        # as "green map" / "culling looks switched" on MUA map imports).
+        col_obj.hide_render = True
 
         # Assign semi-transparent collision material
         col_mat = _get_collision_material()
@@ -1332,6 +1391,7 @@ def _import_collision_hulls(reader, basename, context, operator):
         # Ensure "Colliders" collection exists
         if "Colliders" not in bpy.data.collections:
             coll = bpy.data.collections.new("Colliders")
+            coll.hide_render = True
             context.scene.collection.children.link(coll)
         else:
             coll = bpy.data.collections["Colliders"]
@@ -1405,6 +1465,11 @@ def _is_igz_file(filepath):
 
 def _report(operator, level, message):
     """Report a message through the operator or print to console."""
+    try:
+        from ..utils.igb_log import log as _igb_log
+        _igb_log(level, message)
+    except Exception:
+        pass
     if operator is not None and hasattr(operator, 'report'):
         operator.report({level}, message)
     else:

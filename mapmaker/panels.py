@@ -495,6 +495,30 @@ class MM_PT_Scene_Identity(Panel):
         layout = self.layout
         settings = context.scene.mm_settings
 
+        # One-click load of an existing game map (geometry + entities +
+        # settings) so it can be edited and rebuilt
+        row = layout.row(align=True)
+        row.scale_y = 1.3
+        row.operator("mm.import_full_map", icon='IMPORT',
+                     text="Import Full Map (.igb)")
+        mp_row = layout.row(align=True)
+        mp_row.operator("mm.import_motionpath", icon='CURVE_PATH',
+                        text="Import Motion Path(s)")
+        mp_row.operator("mm.export_motionpath", icon='EXPORT', text="Export")
+
+        # Game preview: play the scene as it behaves in-game
+        sim_row = layout.row(align=True)
+        sim_row.scale_y = 1.2
+        if context.scene.get("mm_simulating"):
+            sim_row.operator("mm.simulate_stop", icon='PAUSE',
+                             text="Stop Simulation")
+        else:
+            sim_row.operator("mm.simulate_play", icon='PLAY',
+                             text="Simulate Map")
+        layout.operator("mm.game_shading", icon='SHADING_RENDERED',
+                        text="Game Shading")
+        layout.separator()
+
         col = layout.column(align=True)
         col.prop(settings, "map_name")
         col.prop(settings, "map_path")
@@ -660,6 +684,10 @@ class MM_PT_Scene_Paths(Panel):
         col = layout.column(align=True)
         col.prop(settings, "output_dir")
         col.prop(settings, "game_data_dir")
+        if not settings.game_data_dir:
+            col.label(text="Needed for audio, NPCs, conversations",
+                      icon='ERROR')
+        col.operator("mm.autodetect_game_dir", icon='VIEWZOOM')
         col.separator()
         col.prop(settings, "automap_path")
         col.label(text="Leave blank for auto: automaps/{map_path}/{map_name}", icon='INFO')

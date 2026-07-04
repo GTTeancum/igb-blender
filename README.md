@@ -1,10 +1,14 @@
 # IGB Blender Addon
 
-**Version 0.4**
+**Version 0.6.0** — see [CHANGELOG.md](CHANGELOG.md) for what's new.
 
-A Blender 4.4 addon for importing and exporting Alchemy Engine IGB/IGZ files used by **X-Men Legends II** and **Marvel Ultimate Alliance** (PC).
+A Blender 4.4 addon for importing and exporting Alchemy Engine IGB/IGZ files used by **X-Men Legends 1 & 2** and **Marvel Ultimate Alliance**.
 
-Includes a full map maker toolkit, actor/skeleton pipeline, rig converter for custom characters, and a texture editor for creating and modifying game textures.
+Includes a full map maker toolkit (with **Import Full Map** — load any game map with its entities, NPCs, motion paths and audio, then edit and rebuild it), a game-accurate **Simulate** + **Game Shading** preview, an actor/skeleton/animation pipeline, a rig converter for custom characters, a full **Conversation Editor** with in-game-style preview and voice playback, and a texture editor for creating and modifying game textures.
+
+> Tip: set **Game Data Dir** once (Map Maker → Scene → Paths, or the
+> **Auto-Detect Game Folder** button) — voice playback, NPC loading,
+> conversations and scene audio all depend on it.
 
 Created by **Kaiko** with the aid of **Claude**.
 

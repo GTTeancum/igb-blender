@@ -436,6 +436,11 @@ class IGBBuilder:
         # Reset state
         self._obj_list = []
         self._ref_infos = []
+        # Per-build texture-chain dedup: a map with many objects sharing one
+        # tileset used to emit a FULL igImage+mipmap copy per submesh. Cache the
+        # built (attr, bind) by (unit, payload) so a shared texture is stored
+        # once — the same dedup the v6/v8 skin builders already do.
+        self._tex_chain_cache = {}
 
         writer = self._init_writer()
 
@@ -518,7 +523,8 @@ class IGBBuilder:
             ])
 
             # --- Vertex data ---
-            vertex_array_idx = self._build_vertex_array(mesh)
+            vertex_array_idx = self._build_vertex_array(
+                mesh, normal_mapped=bool(sub.get('normal_mapped', False)))
 
             # --- Index data (with strip conversion) ---
             strip_indices = triangles_to_strip(mesh.indices)
@@ -871,6 +877,18 @@ class IGBBuilder:
         if texture_levels is None:
             texture_levels = []
 
+        # Dedup identical textures across submeshes: key on the unit + the base
+        # level's dims and compressed bytes (identity is stable — export_igb's
+        # texture_cache hands back the SAME levels object for a shared image).
+        cache = getattr(self, '_tex_chain_cache', None)
+        ckey = None
+        if cache is not None and texture_levels:
+            _cd, _tw, _th = texture_levels[0]
+            ckey = (unit_id, _tw, _th, len(texture_levels), bytes(_cd))
+            hit = cache.get(ckey)
+            if hit is not None:
+                return hit
+
         # Images (base + mipmaps)
         base_img_idx = None
         mip_img_indices = []
@@ -947,7 +965,10 @@ class IGBBuilder:
             (5, unit_id, 'Int', 4),  # unit_id: 0=diffuse, 1=normal, 2=specular
         ])
 
-        return texture_attr_idx, texture_bind_idx
+        result = (texture_attr_idx, texture_bind_idx)
+        if ckey is not None:
+            cache[ckey] = result
+        return result
 
     def _build_clut_texture_chain(self, palette_data, index_data, width, height, tex_name):
         """Build CLUT image + igClut + texture attr + bind.
@@ -1040,12 +1061,20 @@ class IGBBuilder:
             (9, 0, 'UnsignedInt', 4),
         ])
 
-    def _build_vertex_array(self, mesh):
+    def _build_vertex_array(self, mesh, normal_mapped=False):
         """Build igVertexArray1_1 with ext_indexed + position/normal/UV blocks.
+
+        When normal_mapped, also emits per-vertex tangent-frame streams
+        (slots 17/18) so MUA's bump shader can light the unit-1 normal map —
+        the same streams the v4 skin path emits for normal-mapped skins.
 
         Returns the vertex_array object index.
         """
         num_verts = len(mesh.positions)
+
+        # A tangent frame is derived from UVs — fall back to plain format
+        # if a normal-mapped mesh somehow lacks them.
+        normal_mapped = bool(normal_mapped and mesh.uvs)
 
         # igExternalIndexedEntry (80 bytes, 20 uint32 slots)
         ext_indexed = self._build_ext_indexed_data()
@@ -1061,11 +1090,29 @@ class IGBBuilder:
         uv_data = self._pack_uvs(mesh.uvs)
         uv_mb_idx = self._add_mem(MO_OBJECT_DIR_ENTRY, uv_data)
 
-        # Patch ext_indexed with actual memory block indices
-        self._patch_ext_indexed(ext_indexed_mb_idx, pos_mb_idx, norm_mb_idx, uv_mb_idx)
+        tan_mb_idx = bin_mb_idx = -1
+        if normal_mapped:
+            from .skin_builder_v4 import _compute_tangent_frame
+            tangents, binormals = _compute_tangent_frame(
+                mesh.positions, mesh.normals, mesh.uvs, mesh.indices)
+            tan_data = bytearray(num_verts * 12)
+            bin_data = bytearray(num_verts * 12)
+            for i in range(num_verts):
+                struct.pack_into('<fff', tan_data, i * 12, *tangents[i])
+                struct.pack_into('<fff', bin_data, i * 12, *binormals[i])
+            tan_mb_idx = self._add_mem(MO_OBJECT_DIR_ENTRY, bytes(tan_data))
+            bin_mb_idx = self._add_mem(MO_OBJECT_DIR_ENTRY, bytes(bin_data))
 
-        # vertex format: 0x00010003 = pos+texcoord (matches reference)
-        vertex_format = 0x00010003
+        # Patch ext_indexed with actual memory block indices
+        self._patch_ext_indexed(ext_indexed_mb_idx, pos_mb_idx, norm_mb_idx,
+                                uv_mb_idx, tan_mb=tan_mb_idx,
+                                bin_mb=bin_mb_idx)
+
+        # vertex format: 0x00010003 = pos+normal+texcoord (matches reference).
+        # Normal-mapped adds the tangent/binormal stream bits (0xC00000) —
+        # the same bits FMT_NORMAL_MAPPED (0xC10443) adds over FMT_SKINNED_UV
+        # (0x10443) in the v4 skin path, minus the skinning bits.
+        vertex_format = 0x00C10003 if normal_mapped else 0x00010003
 
         return self._add_obj(MO_VERTEX_ARRAY_1_1, [
             (2, ext_indexed_mb_idx, 'MemoryRef', 4),
@@ -1323,17 +1370,27 @@ class IGBBuilder:
         """Build the 80-byte igExternalIndexedEntry (20 x uint32, all 0xFFFFFFFF)."""
         return struct.pack("<" + "I" * 20, *([0xFFFFFFFF] * 20))
 
-    def _patch_ext_indexed(self, ext_mb_idx, pos_mb, norm_mb, uv_mb):
+    def _patch_ext_indexed(self, ext_mb_idx, pos_mb, norm_mb, uv_mb,
+                           tan_mb=-1, bin_mb=-1):
         """Patch the igExternalIndexedEntry memory block with actual indices.
 
         Slot 0: positions, Slot 1: normals, Slot 11: UVs.
         No vertex colors — matching XML2 PC reference files.
+
+        Normal-mapped geometry adds the tangent frame: native binds
+        slot 17 -> D3DDECLUSAGE_BINORMAL and slot 18 -> D3DDECLUSAGE_TANGENT
+        (contents swapped vs our local tangent/binormal names — see the
+        route-swap note in skin_builder_v4._build_vertex_array).
         """
         _, type_idx, data = self._obj_list[ext_mb_idx]
         slots = list(struct.unpack("<" + "I" * 20, data))
         slots[0] = pos_mb
         slots[1] = norm_mb
         slots[11] = uv_mb
+        if bin_mb >= 0:
+            slots[17] = bin_mb   # slot 17 carries BINORMAL (+V)
+        if tan_mb >= 0:
+            slots[18] = tan_mb   # slot 18 carries TANGENT  (+U)
         new_data = struct.pack("<" + "I" * 20, *slots)
         self._obj_list[ext_mb_idx] = ('mem', type_idx, new_data)
 

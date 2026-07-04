@@ -454,6 +454,19 @@ class ACTOR_OT_import_animations(Operator, ImportHelper):
 
         bind_pose = _extract_bind_pose(parsed_anims)
 
+        # v8 (MUA next-gen) afakeanim binds are UNTRUSTWORTHY: usually
+        # degenerate zero-quats (02_daredevil, 33/36), and when they ARE
+        # valid they're authored against a different rig state — applying
+        # 21_nickfury's menu anims through its "valid" bind tilts the whole
+        # body back ~45° (#45), while the absolute + parent-rest-rebase path
+        # renders the correct upright pose. Drop the bind entirely for v8;
+        # v6 (XML2/XML1) binds are proven-correct and keep working.
+        try:
+            if reader.header.version >= 8 and bind_pose:
+                bind_pose = None
+        except Exception:
+            pass
+
         # Populate the cache for the multi-select dialog
         _anim_import_cache['parsed_anims'] = parsed_anims
         _anim_import_cache['bind_pose'] = bind_pose
@@ -481,29 +494,9 @@ def _skin_export_texture_items(self, context):
 
 
 def _skin_export_resolution_items(self, context):
-    """Enum items for skin export texture resolution cap (longest edge).
-
-    Textures are ~80-90% of an exported IGB's size, so this cap is by far the
-    biggest lever on file size. Default is 512: it matches native practice
-    (most retail characters use 256-512px skins) and a character is only
-    ~100-200px wide on screen, so 512 is already 2-4x oversampled. Going from
-    a 1024px source to 512 is ~4x less texture data (e.g. ~3MB -> ~0.8MB).
-    The first item is the EnumProperty default, so '512' must stay first.
-    """
-    return [
-        ('512', "512  (Recommended)",
-         "Cap textures to 512px on the longest edge. ~4x smaller than 1024 "
-         "and visually identical in-game (characters are small on screen). "
-         "Matches native characters, which mostly use 256-512px skins"),
-        ('256', "256  (Smallest)",
-         "Cap textures to 256px. ~16x smaller than 1024 — best for menu "
-         "mannequins or size-constrained mods; slightly softer up close"),
-        ('1024', "1024",
-         "Cap textures to 1024px on the longest edge"),
-        ('original', "Original  (Largest)",
-         "Keep each texture's full source size (rounded up to power-of-2). "
-         "Biggest files; use only if you need maximum texture detail"),
-    ]
+    """Shared texture-resolution cap (longest edge). See exporter.texture_size."""
+    from ..exporter.texture_size import texture_size_items
+    return texture_size_items(self, context)
 
 
 class ACTOR_OT_export_skin(Operator, ExportHelper):
@@ -602,24 +595,27 @@ class ACTOR_OT_export_skin(Operator, ExportHelper):
     )
 
     use_normal_maps: BoolProperty(
-        name="Use Normal Maps (MUA)",
-        description="Export normal + specular maps alongside the diffuse "
-                    "(MUA only, 3ds Max v4 or v8 native format). Reads the "
-                    "Normal Map and Specular textures from each material and "
-                    "emits the tangent-frame vertex data MUA's shader needs. "
-                    "Requires Texture Format = DXT5 (MUA Only) and Skin Format "
-                    "= 3ds Max v4 or v8 (MUA Native). XML2 has no normal maps "
-                    "and ignores this",
-        default=False,
+        name="Normal Maps",
+        description="Export each material's Normal map (MUA only). Also emits "
+                    "the tangent-frame vertex data the bump shader needs. Untick "
+                    "to ship the skin with no normal maps",
+        default=True,
+    )
+
+    use_specular_maps: BoolProperty(
+        name="Specular Maps",
+        description="Export each material's Specular map (MUA only). Untick to "
+                    "drop specular entirely — the quickest way to kill an "
+                    "over-shiny look in advanced lighting",
+        default=True,
     )
 
     use_gloss_map: BoolProperty(
-        name="Use Gloss / Mask Map (v8)",
-        description="Export a gloss/mask map on texture unit 5 (v8 MUA native "
-                    "only). Reads the 'Gloss/Mask Texture' input from each "
-                    "material. Used by MUA's shader for specular masking / "
-                    "glossiness. Ignored unless Skin Format = v8 (MUA Native)",
-        default=False,
+        name="Gloss / Mask Maps",
+        description="Export each material's Gloss/Mask map on texture unit 5 "
+                    "(MUA). Used by the shader for specular masking / "
+                    "glossiness. Untick to omit it",
+        default=True,
     )
 
     use_mipmaps: BoolProperty(
@@ -707,9 +703,13 @@ class ACTOR_OT_export_skin(Operator, ExportHelper):
                       icon='INFO')
         elif self.game_target == 'MUA':
             fmt.label(text="MUA (PC): v4 + DXT5 textures", icon='CHECKMARK')
-            fmt.label(text="Normal + specular maps export automatically.",
-                      icon='TEXTURE')
-            layout.prop(self, "normal_y_flip")
+            mp = layout.box().column(align=True)
+            mp.label(text="Export Maps:", icon='TEXTURE')
+            mp.prop(self, "use_normal_maps")
+            mp.prop(self, "use_specular_maps")
+            mp.prop(self, "use_gloss_map")
+            if self.use_normal_maps:
+                layout.prop(self, "normal_y_flip")
         else:
             fmt.label(text="XML2 (PC): v6 + CLUT textures", icon='SCENE')
             fmt.label(text="No normal/specular maps (XML2 has none).",
@@ -772,9 +772,11 @@ class ACTOR_OT_export_skin(Operator, ExportHelper):
             igb_format = 'V4'        # 3ds Max v4 — the MUA format that loads
             texture_mode = 'dxt5'
             swap_rb = True           # MUA BGR565
-            use_nm = True            # normal + specular maps, auto if present
-            use_gloss = True         # gloss/mask map on texture unit 5 (per
-            #                          material via its 'Use Gloss/Mask Map' toggle)
+            # Respect the export ticks (default ON): user can drop any of the
+            # normal / specular / gloss maps at export time.
+            use_nm = self.use_normal_maps
+            use_spec = self.use_specular_maps
+            use_gloss = self.use_gloss_map
             # Resized / rig-converted characters need the MUA combiner to ground
             # in the character-select menu (no float); native-proportioned skins
             # use the simpler bind-pose form. Auto-detected — no user choice.
@@ -788,6 +790,7 @@ class ACTOR_OT_export_skin(Operator, ExportHelper):
             texture_mode = 'clut'    # universal CLUT, proven in XML2
             swap_rb = False
             use_nm = False           # XML2 has no normal maps
+            use_spec = False
             use_gloss = False        # XML2 uses a single diffuse texture
 
         # PS2 (XML1 / XML2 / MUA1) override: native PS2 actors for ALL THREE
@@ -801,6 +804,7 @@ class ACTOR_OT_export_skin(Operator, ExportHelper):
             texture_mode = 'clut'
             swap_rb = False
             use_nm = False
+            use_spec = False
             use_gloss = False
         elif self.platform == 'GC':
             # GameCube (XML1/XML2): v6 + CMPR (GX-tiled DXT1, pfmt 34). Same
@@ -811,6 +815,7 @@ class ACTOR_OT_export_skin(Operator, ExportHelper):
             texture_mode = 'cmpr'
             swap_rb = False
             use_nm = False
+            use_spec = False
             use_gloss = False
 
         use_mips = True
@@ -829,6 +834,7 @@ class ACTOR_OT_export_skin(Operator, ExportHelper):
             texture_mode = 'dxt5'
             swap_rb = True
             use_nm = False
+            use_spec = False
             use_gloss = False
             self.report({'INFO'},
                         "Mannequin: save as <id>.igb in ui/models/mannequin/ "
@@ -845,6 +851,7 @@ class ACTOR_OT_export_skin(Operator, ExportHelper):
             actor_graph=graph_mode,
             igb_format=igb_format,
             use_normal_maps=use_nm,
+            use_specular_maps=use_spec,
             normal_map_size=normal_map_size,
             use_gloss_map=use_gloss,
             use_mipmaps=use_mips,
@@ -879,8 +886,15 @@ class ACTOR_OT_export_skin(Operator, ExportHelper):
         if not self.mannequin_mode:
             arm = bpy.data.objects.get(props.active_armature)
             if arm is not None:
+                # The user-set target (Materials tab toggle) is authoritative;
+                # fall back to the imported source profile only if unset.
+                tgt = str(arm.get("igb_target_game", "") or "").upper()
                 profile = (arm.get("igb_game_profile", "") or "")
-                if arm.get("igb_source_is_mua_pc") or "Ultimate Alliance" in profile:
+                if tgt == 'MUA':
+                    self.game_target = 'MUA'
+                elif tgt == 'XML2':
+                    self.game_target = 'XML2'
+                elif arm.get("igb_source_is_mua_pc") or "Ultimate Alliance" in profile:
                     self.game_target = 'MUA'
                 elif "X-Men Legends 2" in profile:
                     self.game_target = 'XML2'
@@ -890,6 +904,220 @@ class ACTOR_OT_export_skin(Operator, ExportHelper):
                     self.platform = 'PS2'
                 elif "(GameCube)" in profile:
                     self.platform = 'GC'
+        context.window_manager.fileselect_add(self)
+        return {'RUNNING_MODAL'}
+
+
+def _mannequin_meshes(context):
+    """Resolve the mesh objects for a static mannequin export.
+
+    Works with ANY model — not just a set-up actor skin. Priority:
+      1. The current selection (the universal 'export this' idiom) — BUT if
+         the whole selection belongs to the registered actor skin, export the
+         FULL skin (a partial selection would silently drop the other parts of
+         a multi-part character).
+      2. The registered actor skin, if one is loaded (uses its segment list).
+      3. The active object.
+    Toon-outline shells (igb_is_outline) are filtered out of every path so a
+    statue never carries an inverted black husk.
+
+    Returns (mesh_objs, source_label).
+    """
+    def _gather(objs):
+        return [o for o in objs
+                if o is not None and getattr(o, 'type', None) == 'MESH'
+                and not o.get('igb_is_outline', False)]
+
+    # Resolve the registered actor skin's mesh parts up front (if any), so a
+    # partial selection of a multi-part skin can expand to the whole thing.
+    props = context.scene.igb_actor
+    skin_meshes = []
+    if len(props.skins) > 0 and props.skins_index < len(props.skins):
+        item = props.skins[props.skins_index]
+        skin_obj = bpy.data.objects.get(item.object_name)
+        if skin_obj is not None:
+            from .actor_import import collect_skin_segments
+            segs = collect_skin_segments(props, props.skins_index)
+            skin_meshes = [o for o, is_outline in (segs or [(skin_obj, False)])
+                           if not is_outline and o is not None
+                           and o.type == 'MESH']
+
+    # 1. explicit selection
+    sel = _gather(context.selected_objects)
+    if sel:
+        # If every selected mesh is part of the registered skin, the user is
+        # inspecting the character — export the whole skin, not the subset.
+        skin_set = set(skin_meshes)
+        if skin_set and all(o in skin_set for o in sel):
+            return skin_meshes, 'skin'
+        return sel, 'selection'
+
+    # 2. registered actor skin (nothing selected)
+    if skin_meshes:
+        return skin_meshes, 'skin'
+
+    # 3. active object
+    ao = context.active_object
+    if (ao is not None and ao.type == 'MESH'
+            and not ao.get('igb_is_outline', False)):
+        return [ao], 'active'
+
+    return [], None
+
+
+class ACTOR_OT_export_mannequin(Operator, ExportHelper):
+    """Export the selected model as a STATIC mannequin IGB.
+
+    Works with ANY model — a rigged actor OR a plain mesh with no armature.
+    Bakes the current transform/pose into the geometry and exports it with no
+    armature/skeleton — a statue, keeping the same materials incl. normal/
+    specular/gloss maps (MUA). Save as ui/models/mannequin/<id>.igb."""
+    bl_idname = "actor.export_mannequin"
+    bl_label = "Export Mannequin (Static)"
+    bl_options = {'REGISTER'}
+
+    filename_ext = ".igb"
+
+    filter_glob: StringProperty(
+        default="*.igb",
+        options={'HIDDEN'},
+    )
+
+    game_target: EnumProperty(
+        name="Game",
+        description="Which game this mannequin is for",
+        items=[
+            ('MUA', "Marvel Ultimate Alliance",
+             "DXT5 (MUA BGR) textures with normal/spec/gloss maps"),
+            ('XML2', "X-Men Legends 2",
+             "DXT5 (XML2) textures, no normal maps"),
+        ],
+        default='MUA',
+    )
+
+    normal_y_flip: BoolProperty(
+        name="Flip Normal Green (Y)",
+        description="Convert Blender's OpenGL normal green back to MUA's "
+                    "DirectX convention (leave ON, matches native maps)",
+        default=True,
+    )
+
+    texture_resolution: EnumProperty(
+        name="Max Texture Size",
+        description="Cap every texture (diffuse/normal/spec/gloss) to this "
+                    "longest-edge size. Menu mannequins are small on screen, so "
+                    "512 keeps files small with no visible loss",
+        items=_skin_export_resolution_items,
+    )
+
+    # Per-map export toggles (MUA), default ON — untick to drop a map. E.g.
+    # untick Specular to kill an over-shiny mannequin.
+    use_normal_maps: BoolProperty(name="Normal Maps",
+                                  description="Export normal maps (MUA)",
+                                  default=True)
+    use_specular_maps: BoolProperty(name="Specular Maps",
+                                    description="Export specular maps (MUA) — "
+                                    "untick to drop specular / reduce shine",
+                                    default=True)
+    use_gloss_map: BoolProperty(name="Gloss / Mask Maps",
+                                description="Export gloss/mask maps (MUA)",
+                                default=True)
+
+    # Attributes export_igb reads — a mannequin is pure visual geometry.
+    collision_source = 'NONE'
+    surface_type = 0
+    export_lights = False
+    texture_format = 'dxt5_mua'
+
+    @classmethod
+    def poll(cls, context):
+        # Enable exactly when execute() would find meshes — same resolver, so
+        # the button is never enabled for a selection execute() would reject
+        # (e.g. outline-only), and never disabled when there IS something.
+        return bool(_mannequin_meshes(context)[0])
+
+    def draw(self, context):
+        layout = self.layout
+        meshes, source = _mannequin_meshes(context)
+        box = layout.box()
+        box.label(text="Static Mannequin", icon='OUTLINER_OB_MESH')
+        if meshes:
+            box.label(text=f"Exporting {len(meshes)} mesh(es) "
+                           f"(from {source}).", icon='CHECKMARK')
+        else:
+            box.label(text="Select a mesh to export.", icon='ERROR')
+        box.label(text="Current transform/pose bakes in.", icon='POSE_HLT')
+        box.label(text="No armature is exported (statue).", icon='INFO')
+        layout.prop(self, "game_target")
+        layout.prop(self, "texture_resolution")
+        if self.game_target == 'MUA':
+            mp = layout.box().column(align=True)
+            mp.label(text="Export Maps:", icon='TEXTURE')
+            mp.prop(self, "use_normal_maps")
+            mp.prop(self, "use_specular_maps")
+            mp.prop(self, "use_gloss_map")
+            if self.use_normal_maps:
+                layout.prop(self, "normal_y_flip")
+        box = layout.box()
+        box.label(text="Save as <id>.igb (id = a character slot)",
+                  icon='FILE_TICK')
+        box.label(text="into  ui/models/mannequin/")
+
+    def execute(self, context):
+        from ..exporter.export_igb import export_igb
+
+        mesh_objs, source = _mannequin_meshes(context)
+        if not mesh_objs:
+            self.report({'ERROR'},
+                        "Select a mesh (or import an actor skin) to export")
+            return {'CANCELLED'}
+
+        # Game consequence (mirrors Export IGB): the map path reads these. On
+        # MUA the export ticks (use_normal/specular/gloss) carry the user's
+        # choice; XML2 has no role maps.
+        if self.game_target == 'MUA':
+            self.texture_format = 'dxt5_mua'
+        else:
+            self.texture_format = 'dxt5_xml2'
+            self.use_normal_maps = False
+            self.use_specular_maps = False
+            self.use_gloss_map = False
+
+        self.report({'INFO'},
+                    f"Baking transform/pose into {len(mesh_objs)} mesh(es) "
+                    f"from {source} (static mannequin, no armature)")
+        # bake_transforms=True bakes each object's world matrix into the
+        # geometry so a plain FBX prop (with a +90X object rotation, scale,
+        # or offset) exports correctly placed — not just origin-identity rigs.
+        result = export_igb(context, self.filepath, self, objects=mesh_objs,
+                            bake_transforms=True)
+        if result == {'FINISHED'}:
+            self.report({'INFO'},
+                        "Mannequin: save as <id>.igb in ui/models/mannequin/ "
+                        "(id = character slot)")
+        return result
+
+    def invoke(self, context, event):
+        # Prefill the filename to match what will ACTUALLY be exported: the
+        # skin's <id>.igb only when the resolved source is the skin; otherwise
+        # the exported object's own name (so a plain-model export isn't nudged
+        # toward overwriting an unrelated registered skin file).
+        meshes, source = _mannequin_meshes(context)
+        prefilled = False
+        if source == 'skin':
+            props = context.scene.igb_actor
+            if props.skins_index < len(props.skins):
+                item = props.skins[props.skins_index]
+                if item.filepath and os.path.exists(item.filepath):
+                    dirname = os.path.dirname(item.filepath)
+                    basename = os.path.splitext(
+                        os.path.basename(item.filepath))[0]
+                    # The engine keys mannequins on <id>.igb — offer a clean name
+                    self.filepath = os.path.join(dirname, f"{basename}.igb")
+                    prefilled = True
+        if not prefilled:
+            name = meshes[0].name if meshes else "mannequin"
+            self.filepath = f"{name}.igb"
         context.window_manager.fileselect_add(self)
         return {'RUNNING_MODAL'}
 
@@ -947,6 +1175,71 @@ def _obj_alive(obj):
         return True
     except (ReferenceError, RuntimeError):
         return False
+
+
+def _norm_tex_key(name):
+    """Normalize a texture image name into a round-trip-stable match key.
+
+    Strips Blender duplicate suffixes (.001) and file extensions in any
+    order, lowercased — 'Body.png' before export and 'Body.png.001' on the
+    reimported image both reduce to 'body'.
+    """
+    _EXTS = {'png', 'jpg', 'jpeg', 'tga', 'dds', 'bmp',
+             'tif', 'tiff', 'exr', 'psd', 'webp'}
+    n = (name or '').lower()
+    while True:
+        base, dot, ext = n.rpartition('.')
+        if dot and base and (ext.isdigit() or ext in _EXTS):
+            n = base
+            continue
+        return n
+
+
+# Group-socket + node-layout constants shared with ACTOR_OT_add_material_map.
+_ROLE_SOCKETS = {'normal': 'Normal',
+                 'specular': 'Specular Texture',
+                 'gloss': 'Gloss/Mask Texture'}
+_ROLE_Y_OFFSETS = {'normal': 250, 'specular': 420, 'gloss': 590}
+
+
+def _wire_role_maps(mat, entry):
+    """Wire captured normal/spec/gloss images into a material's IGB group.
+
+    Same wiring as ACTOR_OT_add_material_map (Image Texture feeding the
+    group socket, via a Normal Map node for 'normal'), so the Materials
+    panel and the exporter's _find_role_image both see the maps.
+    Returns the number of maps wired.
+    """
+    grp = _igb_group_node(mat)
+    if grp is None:
+        return 0
+    nt = mat.node_tree
+    count = 0
+    for role, img in entry.get('images', {}).items():
+        if img is None or _role_map_node(mat, role) is not None:
+            continue
+        sock = grp.inputs.get(_ROLE_SOCKETS[role])
+        if sock is None:
+            continue
+        tex = nt.nodes.new('ShaderNodeTexImage')
+        tex.label = role.capitalize() + " Map"
+        tex.image = img
+        y = grp.location.y - _ROLE_Y_OFFSETS[role]
+        tex.location = (grp.location.x - 650, y)
+        if role == 'normal':
+            nm = nt.nodes.new('ShaderNodeNormalMap')
+            nm.location = (grp.location.x - 320, y)
+            nt.links.new(tex.outputs['Color'], nm.inputs['Color'])
+            nt.links.new(nm.outputs['Normal'], sock)
+        else:
+            nt.links.new(tex.outputs['Color'], sock)
+        count += 1
+    for attr, val in entry.get('flags', {}).items():
+        try:
+            setattr(mat, attr, val)
+        except Exception:
+            pass
+    return count
 
 
 def _round_trip_skin(context, armature_obj, props, operator=None):
@@ -1022,6 +1315,45 @@ def _round_trip_skin(context, armature_obj, props, operator=None):
                 old_collection = coll
                 break
 
+        # Capture the conversion stamps BEFORE the original armature is
+        # deleted — the reimport builds a fresh object and would otherwise
+        # default to XML2, hiding the MUA-only normal/spec/gloss map UI and
+        # export options the user converted FOR.
+        carry_props = {}
+        for key in ("igb_target_game", "igb_full_fingers"):
+            if key in armature_obj:
+                carry_props[key] = armature_obj[key]
+
+        # Also capture normal/spec/gloss role maps per material. The
+        # round-trip IGB only carries the diffuse, so without this any maps
+        # the user (or the FBX importer) wired up are silently lost. Keyed
+        # by diffuse texture name — the one identity that survives the trip
+        # (the exporter writes it into the IGB, the importer names the
+        # rebuilt image/material from it). The bpy Images themselves outlive
+        # the mesh deletion (data-blocks aren't purged mid-session).
+        from ..exporter.skin_export import (_find_role_image,
+                                            _get_texture_name)
+        carry_maps = {}
+        for mc in mesh_children:
+            for slot_i, mat in enumerate(mc.data.materials or []):
+                if mat is None or not mat.use_nodes or mat.node_tree is None:
+                    continue
+                tex_key = _norm_tex_key(_get_texture_name(mc,
+                                                          mat_slot=slot_i))
+                if not tex_key:
+                    continue
+                entry = carry_maps.setdefault(tex_key,
+                                              {'images': {}, 'flags': {}})
+                for role in ('normal', 'specular', 'gloss'):
+                    img = _find_role_image(mat, role)
+                    if img is not None and role not in entry['images']:
+                        entry['images'][role] = img
+                for attr in ('igb_use_normal_map', 'igb_use_specular_map',
+                             'igb_use_gloss_map'):
+                    entry['flags'][attr] = bool(getattr(mat, attr, True))
+        # Drop keys that carried nothing
+        carry_maps = {k: v for k, v in carry_maps.items() if v['images']}
+
         # 3. Delete original armature and ALL skinned meshes (children AND
         # modifier-linked meshes that aren't parented to the armature)
         to_remove = {c.name for c in armature_obj.children}
@@ -1056,9 +1388,16 @@ def _round_trip_skin(context, armature_obj, props, operator=None):
 
         new_armature, skin_objects, actions = result
 
-        # 5. Set game-scale properties
+        # 5. Set game-scale properties + restore the conversion stamps (the
+        # target game drives the Materials panel's MUA map slots + export
+        # defaults; without it a converted-for-MUA rig reads as XML2)
         new_armature["igb_export_scale"] = 1.0
         new_armature["igb_converted_rig"] = False
+        for key, val in carry_props.items():
+            new_armature[key] = val
+        if str(carry_props.get("igb_target_game", "")).upper() == 'MUA':
+            # display-name convention (matches actor_import's stamping)
+            new_armature["igb_game_profile"] = "Marvel: Ultimate Alliance (PC)"
 
         # 5b. Fix non-deforming bone orientations
         _fix_nondeforming_bone_orientations(new_armature)
@@ -1066,6 +1405,34 @@ def _round_trip_skin(context, armature_obj, props, operator=None):
         # 5c. Add default IGB material properties
         for _, mesh_obj in skin_objects:
             _ensure_igb_material_properties(mesh_obj)
+
+        # 5c2. Reattach the captured normal/spec/gloss maps to the
+        # reimported materials (matched by diffuse texture name; wiring
+        # mirrors ACTOR_OT_add_material_map so the Materials panel and the
+        # exporter both see them). Blue tangent-space normals are fine to
+        # carry as-is — export converts them to MUA DXT5nm automatically.
+        if carry_maps:
+            reattached = 0
+            seen_mats = set()
+            for _v, mesh_obj in skin_objects:
+                if not _obj_alive(mesh_obj) or mesh_obj.type != 'MESH':
+                    continue
+                for slot_i, mat in enumerate(
+                        mesh_obj.data.materials or []):
+                    if (mat is None or mat.name in seen_mats
+                            or not mat.use_nodes
+                            or mat.node_tree is None):
+                        continue
+                    seen_mats.add(mat.name)
+                    tex_key = _norm_tex_key(
+                        _get_texture_name(mesh_obj, mat_slot=slot_i))
+                    entry = carry_maps.get(tex_key)
+                    if entry:
+                        reattached += _wire_role_maps(mat, entry)
+            if reattached:
+                _report({'INFO'},
+                        f"Carried {reattached} normal/spec/gloss map(s) "
+                        f"through the round-trip")
 
         # 5d. Restore the user's mesh layout: IGB import splits the model
         # into one object per material — if the user had a single combined
@@ -1196,17 +1563,17 @@ class ACTOR_OT_setup_skin(Operator):
         name="Skeleton",
         description="How the skeleton relates to the game's shared biped",
         items=[
-            ('NATIVE', "Native Skeleton (Recommended)",
+            ('KEEP', "Keep Model Proportions (Default)",
+             "Keep the model's own limb lengths (pelvis still anchored at "
+             "native height). Preserves the model's proportions; deep "
+             "crouch/jump animations may show slight foot deviation"),
+            ('NATIVE', "Native Skeleton",
              "Warp the mesh onto the game's exact shared biped (every "
              "official skin uses this identical skeleton). All animations "
              "behave exactly like official characters: no floating, no "
              "sinking, standard size. Stylized proportions get adjusted"),
-            ('KEEP', "Keep Model Proportions",
-             "Keep the model's own limb lengths (pelvis still anchored at "
-             "native height). Preserves stylized proportions but deep "
-             "crouch/jump animations may show slight foot deviation"),
         ],
-        default='NATIVE',
+        default='KEEP',
     )
 
     align_pose: BoolProperty(
@@ -1599,10 +1966,14 @@ class ACTOR_OT_pick_animation(Operator):
 
                 target_reader = IGBReader(target_anim_file)
                 target_reader.read()
-                target_skel = extract_skeleton(target_reader)
-                if target_skel:
-                    target_anims = extract_animations(target_reader, target_skel)
-                    target_bind_pose = _extract_bind_pose(target_anims)
+                # v8 afakeanim binds are unreliable (see the browse operator's
+                # source-bind gate) — don't derive target translations from one.
+                if target_reader.header.version < 8:
+                    target_skel = extract_skeleton(target_reader)
+                    if target_skel:
+                        target_anims = extract_animations(target_reader,
+                                                          target_skel)
+                        target_bind_pose = _extract_bind_pose(target_anims)
             except Exception:
                 pass  # Fall back to source bind_pose
 
@@ -1636,12 +2007,60 @@ class ACTOR_OT_pick_animation(Operator):
         imported_count = 0
         try:
             for pa in selected:
-                action = build_action(armature_obj, pa, bind_pose=bind_pose,
+                # Identity-hold clips (e.g. lunge_loop) contain no pose of
+                # their own — in-game they hold whatever the ENTRY anim left.
+                # When the moveset has the matching '<stem>_start', preview
+                # the hold with that anim's FINAL pose instead of rest.
+                pa_to_build = pa
+                hold_from = None
+                if (getattr(pa, 'identity_hold', False)
+                        and pa.name.lower().endswith('_loop')):
+                    stem = pa.name[:-len('_loop')]
+                    start_pa = next(
+                        (p for p in parsed_anims
+                         if p.name.lower() == (stem + '_start').lower()
+                         and not getattr(p, 'identity_hold', False)), None)
+                    if start_pa is not None and start_pa.tracks:
+                        from .sg_animation import (ParsedAnimation,
+                                                   ParsedAnimationTrack,
+                                                   ParsedKeyframe)
+                        held_tracks = []
+                        for t in start_pa.tracks:
+                            if not t.keyframes:
+                                continue
+                            last = t.keyframes[-1]
+                            held_tracks.append(ParsedAnimationTrack(
+                                bone_name=t.bone_name,
+                                bone_index=t.bone_index,
+                                keyframes=[ParsedKeyframe(
+                                    time_ms=0.0,
+                                    quaternion=last.quaternion,
+                                    translation=last.translation)],
+                                is_constant=True))
+                        if held_tracks:
+                            pa_to_build = ParsedAnimation(
+                                name=pa.name,
+                                duration_ms=pa.duration_ms,
+                                tracks=held_tracks,
+                                priority=pa.priority)
+                            hold_from = start_pa.name
+
+                # rebase_unanimated_parents fixes MUA v8 menu movesets whose
+                # unanimated root rest differs from the skin's (#45 nickfury
+                # tilt-back). Internally gated to fire only when the anim's
+                # bind quat is absent/degenerate, so XML2/v6 files (valid
+                # binds, already correct) are untouched.
+                action = build_action(armature_obj, pa_to_build,
+                                      bind_pose=bind_pose,
                                       bone_remap=bone_remap,
                                       target_bind_pose=target_bind_pose,
-                                      anim_armature=anim_armature)
+                                      anim_armature=anim_armature,
+                                      rebase_unanimated_parents=True)
                 if action is None:
                     continue
+                if hold_from:
+                    action["igb_identity_hold"] = True
+                    action["igb_hold_from"] = hold_from
 
                 item = props.animations.add()
                 item.name = action.name
@@ -2407,6 +2826,911 @@ class ACTOR_OT_cleanup_vmc(Operator):
         return {'FINISHED'}
 
 
+class ACTOR_OT_vr_retarget(Operator):
+    """Retarget a Unity / VR source armature's recorded motion onto the loaded
+    actor's Bip01 skeleton, baking a new Action ready to export as an IGB"""
+    bl_idname = "actor.vr_retarget"
+    bl_label = "Retarget VR Motion"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        props = context.scene.igb_actor
+        if (not props.active_armature or
+                props.active_armature not in bpy.data.objects):
+            return False
+        src = props.vr_source_armature
+        return (bool(src) and src in bpy.data.objects and
+                src != props.active_armature)
+
+    def execute(self, context):
+        from .vr_mocap import retarget_and_bake
+
+        props = context.scene.igb_actor
+        tgt = bpy.data.objects.get(props.active_armature)
+        src = bpy.data.objects.get(props.vr_source_armature)
+        if tgt is None or tgt.type != 'ARMATURE':
+            self.report({'ERROR'}, "Active actor is not an armature")
+            return {'CANCELLED'}
+        if src is None or src.type != 'ARMATURE':
+            self.report({'ERROR'}, "Source is not an armature")
+            return {'CANCELLED'}
+
+        # Game from the actor's stored import profile (FX-bone aliases).
+        profile = (tgt.get("igb_game_profile", "") or "").lower()
+        game = 'mua' if 'mua' in profile else 'xml2'
+
+        # Frame range: source Action range, or the manual range.
+        src_action = (src.animation_data.action
+                      if src.animation_data else None)
+        if props.vr_use_action_range and src_action:
+            fr = src_action.frame_range
+            f0, f1 = int(fr[0]), int(fr[1])
+        else:
+            f0, f1 = int(props.vr_frame_start), int(props.vr_frame_end)
+        if f1 < f0:
+            f0, f1 = f1, f0
+
+        base = src_action.name if src_action else src.name
+        action_name = "VR_" + base
+
+        try:
+            action, n_mapped, n_frames = retarget_and_bake(
+                src, tgt, f0, f1, game=game, action_name=action_name,
+                root_motion=props.vr_root_motion)
+        except Exception as exc:
+            import traceback
+            traceback.print_exc()
+            self.report({'ERROR'}, f"Retarget failed: {exc}")
+            return {'CANCELLED'}
+
+        if action is None:
+            self.report({'ERROR'},
+                        "Retarget failed — fewer than 3 source bones matched "
+                        "the Bip01 skeleton. Check bone names in the console.")
+            return {'CANCELLED'}
+
+        self.report({'INFO'},
+                    f"Baked '{action.name}': {n_mapped} bones over "
+                    f"{n_frames} frames. Now export it as a new IGB below.")
+        return {'FINISHED'}
+
+
+class ACTOR_OT_import_mocap(Operator, ImportHelper):
+    """Import a mocap performance file (e.g. actors/zone_briefing1_10.igb) as a
+    visible mocap rig with every performance available as an Action"""
+    bl_idname = "actor.import_mocap"
+    bl_label = "Import Mocap Performance"
+    bl_options = {'REGISTER', 'UNDO'}
+    filename_ext = ".igb"
+    filter_glob: StringProperty(default="*.igb", options={'HIDDEN'})
+
+    def execute(self, context):
+        from .mocap_tools import import_mocap
+        try:
+            res = import_mocap(context, self.filepath, operator=self)
+        except Exception as exc:
+            import traceback
+            traceback.print_exc()
+            self.report({'ERROR'}, f"Mocap import failed: {exc}")
+            return {'CANCELLED'}
+        if not res:
+            self.report({'ERROR'}, "No mocap rig / animations found in file")
+            return {'CANCELLED'}
+        arm, actions = res
+        context.scene.igb_actor.mocap_source_armature = arm.name
+        self.report({'INFO'},
+                    f"Imported mocap rig '{arm.name}': {len(arm.data.bones)} "
+                    f"bones, {len(actions)} performances. Set as retarget source "
+                    f"— pick one from the Action editor, then Retarget.")
+        return {'FINISHED'}
+
+
+class ACTOR_OT_retarget_mocap(Operator):
+    """Retarget the mocap rig's active performance onto the loaded actor's rig"""
+    bl_idname = "actor.retarget_mocap"
+    bl_label = "Retarget Performance onto Actor"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        props = context.scene.igb_actor
+        src = props.mocap_source_armature
+        return (props.active_armature and
+                props.active_armature in bpy.data.objects and
+                src and src in bpy.data.objects and
+                src != props.active_armature)
+
+    def execute(self, context):
+        from .mocap_tools import retarget_performance
+        props = context.scene.igb_actor
+        tgt = bpy.data.objects.get(props.active_armature)
+        src = bpy.data.objects.get(props.mocap_source_armature)
+        if src is None or src.type != 'ARMATURE':
+            self.report({'ERROR'}, "Mocap rig not found")
+            return {'CANCELLED'}
+        if tgt is None or tgt.type != 'ARMATURE':
+            self.report({'ERROR'}, "Target actor is not an armature")
+            return {'CANCELLED'}
+        perf = (src.animation_data.action
+                if src.animation_data else None)
+        if perf is None:
+            self.report({'ERROR'},
+                        "Pick a performance first — set an Action on the mocap "
+                        "rig (Action editor / dope sheet)")
+            return {'CANCELLED'}
+        profile = (tgt.get("igb_game_profile", "") or "").lower()
+        game = 'mua' if 'mua' in profile else 'xml2'
+        if props.mocap_full_range:
+            fr = perf.frame_range
+            f0, f1 = int(fr[0]), int(fr[1])
+        else:
+            f0, f1 = int(props.mocap_frame_start), int(props.mocap_frame_end)
+        if f1 < f0:
+            f0, f1 = f1, f0
+        try:
+            action, nmap, nfr = retarget_performance(
+                src, tgt, perf, f0, f1, game=game,
+                root_motion=props.mocap_root_motion)
+        except Exception as exc:
+            import traceback
+            traceback.print_exc()
+            self.report({'ERROR'}, f"Retarget failed: {exc}")
+            return {'CANCELLED'}
+        if action is None:
+            self.report({'ERROR'},
+                        "Retarget failed — too few bones matched the character")
+            return {'CANCELLED'}
+        if tgt.animation_data is None:
+            tgt.animation_data_create()
+        tgt.animation_data.action = action
+        self.report({'INFO'},
+                    f"Retargeted '{perf.name}': {nmap} bones over {nfr} frames "
+                    f"onto {tgt.name}")
+        return {'FINISHED'}
+
+
+class ACTOR_OT_export_mocap(Operator, ExportHelper):
+    """Export the active armature's active Action to a v6 zone-style mocap IGB"""
+    bl_idname = "actor.export_mocap"
+    bl_label = "Export Mocap (zone IGB)"
+    bl_options = {'REGISTER'}
+    filename_ext = ".igb"
+    filter_glob: StringProperty(default="*.igb", options={'HIDDEN'})
+    anim_name: StringProperty(name="Performance Name", default="zone1")
+
+    @classmethod
+    def poll(cls, context):
+        props = context.scene.igb_actor
+        arm = (bpy.data.objects.get(props.active_armature)
+               if props.active_armature else None)
+        return (arm is not None and arm.animation_data is not None and
+                arm.animation_data.action is not None)
+
+    def execute(self, context):
+        from .mocap_tools import export_performance
+        props = context.scene.igb_actor
+        arm = bpy.data.objects.get(props.active_armature)
+        act = arm.animation_data.action
+        profile = (arm.get("igb_game_profile", "") or "").lower()
+        game = 'mua' if 'mua' in profile else 'xml2'
+        try:
+            r = export_performance(arm, act, self.filepath, game=game,
+                                   anim_name=self.anim_name)
+        except Exception as exc:
+            import traceback
+            traceback.print_exc()
+            self.report({'ERROR'}, f"Export failed: {exc}")
+            return {'CANCELLED'}
+        if not r:
+            self.report({'ERROR'},
+                        "Export failed — no reference mocap IGB found. Import a "
+                        "mocap file first (its schema is reused).")
+            return {'CANCELLED'}
+        self.report({'INFO'},
+                    f"Exported '{self.anim_name}' to "
+                    f"{os.path.basename(self.filepath)} "
+                    f"({os.path.getsize(self.filepath)} bytes)")
+        return {'FINISHED'}
+
+    def invoke(self, context, event):
+        props = context.scene.igb_actor
+        arm = (bpy.data.objects.get(props.active_armature)
+               if props.active_armature else None)
+        if arm and arm.animation_data and arm.animation_data.action:
+            a = arm.animation_data.action
+            self.anim_name = a.get("igb_anim_name", a.name)
+        context.window_manager.fileselect_add(self)
+        return {'RUNNING_MODAL'}
+
+
+class ACTOR_OT_load_briefing(Operator, ImportHelper):
+    """Load a full briefing scene — map + cast (skins) + staging positions +
+    mocap performances + voice audio — into one editable collection"""
+    bl_idname = "actor.load_briefing"
+    bl_label = "Load Briefing"
+    bl_options = {'REGISTER', 'UNDO'}
+    filename_ext = ".igb"
+    filter_glob: StringProperty(default="*.igb", options={'HIDDEN'})
+
+    apply_performances: BoolProperty(
+        name="Apply Performances", default=True,
+        description="Direct-apply each character's zone performance onto its "
+                    "65-bone mocap model (no retarget)")
+    root_motion: BoolProperty(
+        name="Keep Root Motion", default=False,
+        description="Keep the performance's root translation. Off keeps the "
+                    "cast on their staging marks (recommended)")
+    load_audio: BoolProperty(
+        name="Load Voice Audio", default=True,
+        description="Decode the ZSNDPC voice bank and add it to the sequencer")
+    load_camera: BoolProperty(
+        name="Import Script Camera", default=True,
+        description="Build an animated camera from the briefing script's "
+                    "cameraMove/cameraPan timeline and set it as the scene "
+                    "camera (scene ready to play/render)")
+    asset_root: StringProperty(
+        name="Asset Root", default="", subtype='DIR_PATH',
+        description="Optional: force the game data root (the folder holding "
+                    "actors/, maps/, scripts/, data/) to grab actor/mocap "
+                    "files from. Leave blank to auto-detect from the picked "
+                    "map. Set this to point at another game's assets, e.g. the "
+                    "XML1 'Decompiled Assets - PS2' folder")
+
+    def draw(self, context):
+        col = self.layout.column()
+        col.prop(self, "apply_performances")
+        sub = col.column()
+        sub.enabled = self.apply_performances
+        sub.prop(self, "root_motion")
+        col.prop(self, "load_audio")
+        col.prop(self, "load_camera")
+        col.separator()
+        col.prop(self, "asset_root")
+        col.label(text="Blank = auto-detect from the map", icon='INFO')
+
+    def execute(self, context):
+        from .briefing_loader import load_briefing
+        opts = {"apply_performances": self.apply_performances,
+                "root_motion": self.root_motion,
+                "audio": self.load_audio, "camera": self.load_camera,
+                "game_dir": (self.asset_root.strip() or None),
+                "operator": self}
+        try:
+            s = load_briefing(context, self.filepath, options=opts)
+        except Exception as exc:
+            import traceback
+            traceback.print_exc()
+            self.report({'ERROR'}, f"Briefing load failed: {exc}")
+            return {'CANCELLED'}
+        if not s:
+            self.report({'ERROR'}, "Briefing load failed — see console")
+            return {'CANCELLED'}
+        nanim = sum(1 for _n, st in s["characters"] if "direct-applied" in st)
+        nchar = sum(1 for _n, st in s["characters"]
+                    if "direct-applied" in st or "placed" in st)
+        end = s.get("frame_end", 0)
+        self.report({'INFO'},
+                    f"Loaded '{s['name']}': map={s['map']} chars={nchar}/"
+                    f"{len(s['characters'])} animated={nanim}"
+                    + (f", timeline 1..{end} — press Play/scrub to see the "
+                       f"briefing" if end else ""))
+        return {'FINISHED'}
+
+
+def _side_counterpart_group(name):
+    """'Bip01 L X' <-> 'Bip01 R X' / 'Bip01_L_X' <-> 'Bip01_R_X', else None."""
+    for a, b in ((' L ', ' R '), ('_L_', '_R_')):
+        if a in name:
+            return name.replace(a, b, 1)
+        if b in name:
+            return name.replace(b, a, 1)
+    return None
+
+
+class ACTOR_OT_mirror_weights(Operator):
+    """Mirror vertex weights from one side of the body to the other.
+
+    Blender's built-in X-mirror can't flip game bone names (the L/R sits
+    MID-name: 'Bip01 L UpperArm'), so weight-paint symmetry never finds the
+    opposite group. This operator pairs vertices across the rig's own
+    symmetry plane (auto-detected from the L/R bone heads) and copies each
+    source-half vertex's weights onto its mirror partner with the group
+    names side-swapped. Paint one side, mirror to the other"""
+    bl_idname = "actor.mirror_weights"
+    bl_label = "Mirror Weights"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    direction: EnumProperty(
+        name="Direction",
+        items=[('L2R', "Left → Right", "Left half is the source"),
+               ('R2L', "Right → Left", "Right half is the source")],
+        default='L2R')
+    tolerance: FloatProperty(
+        name="Match Tolerance", default=0.02, min=0.0001, max=1.0,
+        description="Max distance (as a fraction of the mesh size) between a "
+                    "vertex and its mirrored position to count as a pair")
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        return (obj is not None and obj.type == 'MESH'
+                and obj.parent is not None and obj.parent.type == 'ARMATURE')
+
+    def execute(self, context):
+        from mathutils import Vector, kdtree
+
+        mesh_obj = context.active_object
+        arm = mesh_obj.parent
+
+        # --- symmetry plane from paired bone heads (world space) ---
+        pairs = []
+        for b in arm.data.bones:
+            cp = _side_counterpart_group(b.name)
+            if cp and cp in arm.data.bones and b.name < cp:
+                hl = arm.matrix_world @ b.head_local
+                hr = arm.matrix_world @ arm.data.bones[cp].head_local
+                pairs.append((b.name, hl, hr))
+        if not pairs:
+            self.report({'ERROR'}, "No L/R bone pairs found on the armature")
+            return {'CANCELLED'}
+        # dominant flip axis + plane offset
+        axis_votes = [0.0, 0.0, 0.0]
+        offsets = []
+        for _n, hl, hr in pairs:
+            d = hl - hr
+            for i in range(3):
+                axis_votes[i] += abs(d[i])
+        axis = axis_votes.index(max(axis_votes))
+        for _n, hl, hr in pairs:
+            offsets.append((hl[axis] + hr[axis]) * 0.5)
+        plane = sum(offsets) / len(offsets)
+        # which side of the plane is "L"?
+        l_sign = 1.0 if (sum(hl[axis] for _n, hl, _hr in pairs)
+                         / len(pairs)) >= plane else -1.0
+        src_sign = l_sign if self.direction == 'L2R' else -l_sign
+
+        # --- vertex world positions + KD tree over the SOURCE half only ---
+        # (target verts PULL from their mirrored source position: game meshes
+        # stack duplicate verts on UV/material seams, and a push-based write
+        # to "the nearest target vert" reaches only one duplicate per spot)
+        mw = mesh_obj.matrix_world
+        verts = mesh_obj.data.vertices
+        n = len(verts)
+        wpos = [mw @ v.co for v in verts]
+
+        import mathutils
+        bb = [mw @ Vector(c) for c in mesh_obj.bound_box]
+        size = max((max(p[i] for p in bb) - min(p[i] for p in bb))
+                   for i in range(3))
+        tol = max(1e-6, self.tolerance * size)
+        eps = tol * 0.5
+
+        src_idx = [i for i, p in enumerate(wpos)
+                   if (p[axis] - plane) * src_sign > eps]
+        if not src_idx:
+            self.report({'ERROR'}, "No vertices found on the source half")
+            return {'CANCELLED'}
+        kd = kdtree.KDTree(len(src_idx))
+        for i in src_idx:
+            kd.insert(wpos[i], i)
+        kd.balance()
+
+        # --- group name maps ---
+        groups = mesh_obj.vertex_groups
+        gidx = {g.name: g.index for g in groups}
+
+        def target_group_for(src_name):
+            cp = _side_counterpart_group(src_name)
+            return cp if cp else src_name   # center bones map to themselves
+
+        # snapshot source weights (vertex -> [(gi, w)]) BEFORE writes
+        vert_groups = {}
+        for v in verts:
+            vert_groups[v.index] = [(g.group, g.weight) for g in v.groups
+                                    if g.weight > 1e-5]
+        gname = {g.index: g.name for g in groups}
+
+        # --- mirror: each TARGET-half vertex PULLS from its mirrored source ---
+        written = 0
+        no_partner = 0
+        for j, p in enumerate(wpos):
+            s = p[axis] - plane
+            if s * src_sign >= -eps:     # not on the target half
+                continue
+            mp = p.copy()
+            mp[axis] = plane - s         # reflect into the source half
+            _co, i, dist = kd.find(mp)
+            if i is None or dist > tol:
+                no_partner += 1
+                continue
+            # clear this vert's existing weights, then copy side-swapped
+            for g in groups:
+                try:
+                    g.remove([j])
+                except RuntimeError:
+                    pass
+            for gi, w in vert_groups[i]:
+                tname = target_group_for(gname[gi])
+                tg = groups.get(tname)
+                if tg is None:
+                    tg = groups.new(name=tname)
+                    gname[tg.index] = tname
+                tg.add([j], w, 'REPLACE')
+            written += 1
+
+        axis_name = "XYZ"[axis]
+        self.report({'INFO'},
+                    f"Mirrored {written} verts "
+                    f"({'L→R' if self.direction == 'L2R' else 'R→L'}, "
+                    f"{axis_name}-plane at {plane:.2f}"
+                    + (f", {no_partner} without a mirror partner"
+                       if no_partner else "") + ")")
+        return {'FINISHED'}
+
+
+class ACTOR_OT_convert_normal_mua(Operator):
+    """Convert this material's normal map to the MUA channel layout
+    (X→alpha, Y→green — what the game's bump shader reads) as a new image
+    named <name>_MUA. NOTE: the exporter already does this automatically on
+    every MUA export, so a standard blue normal map works as-is — this
+    operator is for previewing / saving the converted map"""
+    bl_idname = "actor.convert_normal_mua"
+    bl_label = "Convert Normal Map for MUA (preview)"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    material_name: StringProperty()
+
+    def execute(self, context):
+        from ..exporter.skin_export import convert_normal_rgba_to_mua
+        mat = bpy.data.materials.get(self.material_name)
+        if mat is None:
+            self.report({'ERROR'}, "Material not found")
+            return {'CANCELLED'}
+        node = _role_map_node(mat, 'normal')
+        img = node.image if node is not None else None
+        if img is None or img.size[0] == 0:
+            self.report({'ERROR'}, "No normal map image on this material")
+            return {'CANCELLED'}
+        w, h = img.size
+        px = [0.0] * (w * h * 4)
+        img.pixels.foreach_get(px)
+        src = bytearray(int(max(0.0, min(1.0, v)) * 255.0 + 0.5) for v in px)
+        out = convert_normal_rgba_to_mua(src, normal_y_flip=True)
+        name = f"{img.name.rsplit('.', 1)[0]}_MUA"
+        new = bpy.data.images.get(name)
+        if new is None or tuple(new.size) != (w, h):
+            new = bpy.data.images.new(name, w, h, alpha=True)
+        new.pixels.foreach_set([v / 255.0 for v in out])
+        new.pack()
+        self.report({'INFO'},
+                    f"Created '{name}' (MUA layout: X→alpha, Y→green). "
+                    f"Export already converts automatically — this is a "
+                    f"preview copy.")
+        return {'FINISHED'}
+
+
+def _target_holder(context):
+    """The object that stores the actor's target game: the active armature if
+    there is one, else the active mesh (so a bare model can be tagged too)."""
+    props = context.scene.igb_actor
+    arm = (bpy.data.objects.get(props.active_armature)
+           if props.active_armature else None)
+    if arm is not None:
+        return arm
+    ao = context.active_object
+    return ao if (ao is not None and ao.type in ('ARMATURE', 'MESH')) else None
+
+
+def actor_target_game(context):
+    """Resolve the loaded actor's target game ('XML2' / 'MUA'), default XML2."""
+    holder = _target_holder(context)
+    return str(holder.get("igb_target_game", "XML2")) if holder else "XML2"
+
+
+class ACTOR_OT_set_target_game(Operator):
+    """Switch the loaded actor's target game (XML2 / MUA) at will. Controls
+    which material features show (MUA has normal/spec/gloss maps) and the
+    format the exporter uses. Re-export to apply the new format in-game."""
+    bl_idname = "actor.set_target_game"
+    bl_label = "Set Target Game"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    target: EnumProperty(
+        name="Target",
+        items=[('XML2', "XML2", "X-Men Legends 2 (v6 + CLUT, no normal maps)"),
+               ('MUA', "MUA", "Marvel Ultimate Alliance (v4 + DXT5, "
+                              "normal/specular/gloss maps)")],
+        default='MUA',
+    )
+
+    @classmethod
+    def poll(cls, context):
+        return _target_holder(context) is not None
+
+    def execute(self, context):
+        holder = _target_holder(context)
+        if holder is None:
+            self.report({'ERROR'}, "No actor / mesh to set a target on")
+            return {'CANCELLED'}
+        holder["igb_target_game"] = self.target
+        # Keep the display profile in sync so the Export dialog pre-selects the
+        # same game (its invoke reads igb_target_game first now, but this keeps
+        # the summary + any profile readers consistent).
+        holder["igb_game_profile"] = ("Marvel: Ultimate Alliance (PC)"
+                                      if self.target == 'MUA'
+                                      else "X-Men Legends 2 (PC)")
+        self.report({'INFO'},
+                    f"Target set to {self.target} — re-export to apply the "
+                    f"{'MUA (v4+DXT5)' if self.target == 'MUA' else 'XML2 (v6+CLUT)'} "
+                    f"format in-game")
+        return {'FINISHED'}
+
+
+class ACTOR_OT_convert_skin_materials(Operator):
+    """Convert ALL of this actor's skin materials to IGB materials for the
+    current target — sets the render state AND adds the .IGB Material node
+    (so you can add/edit Normal / Specular / Gloss maps on MUA)."""
+    bl_idname = "actor.convert_skin_materials"
+    bl_label = "Convert All to IGB"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        from .panels import _actor_material_meshes
+        return bool(_actor_material_meshes(context))
+
+    def execute(self, context):
+        from ..panels import _convert_material_to_igb
+        from ..utils.material_nodes import add_igb_node_to_material
+        from .panels import _actor_material_meshes
+
+        meshes = _actor_material_meshes(context)
+        if not meshes:
+            self.report({'ERROR'}, "No skin materials to convert")
+            return {'CANCELLED'}
+
+        seen = set()
+        converted = 0
+        for mo in meshes:
+            for m in mo.data.materials:
+                if m is None or m.name in seen or m.name == "IGB_Collision":
+                    continue
+                seen.add(m.name)
+                if not m.use_nodes:
+                    m.use_nodes = True
+                # Render-state custom props (blend/alpha/color/lighting/cull).
+                _convert_material_to_igb(m)
+                # The .IGB Material node group (Base/Normal/Specular/Gloss
+                # sockets) — what makes the map slots available to edit + export.
+                try:
+                    add_igb_node_to_material(m)
+                except Exception:
+                    pass
+                converted += 1
+
+        tgt = actor_target_game(context)
+        self.report({'INFO'},
+                    f"Converted {converted} material(s) to IGB ({tgt}). "
+                    f"{'Normal/spec/gloss maps are now editable.' if tgt == 'MUA' else ''}")
+        return {'FINISHED'}
+
+
+def _connect_armature_bones(arm, frame_step=1, report=None):
+    """Reorient bones tail->child (connected look) WITHOUT changing the mesh.
+
+    The mesh deform of bone b is `deform_b = pose_b . rest_b^-1`. We capture it
+    (per frame if animated), reorient the bones (which changes rest_b), then
+    re-pose as `deform_b . new_rest_b` so the deform — and therefore the mesh —
+    is preserved EXACTLY, while each bone sits at its reoriented (connected)
+    frame. Proven mesh-invariant (max vertex delta ~3e-5). Returns (n_connected,
+    n_total_children).
+    """
+    from mathutils import Matrix
+
+    def horder():
+        out = []
+        def walk(b):
+            out.append(b.name)
+            for c in b.children:
+                walk(c)
+        for b in arm.data.bones:
+            if b.parent is None:
+                walk(b)
+        return out
+    order = horder()
+
+    act = arm.animation_data.action if arm.animation_data else None
+    # Frames to preserve: the action's keyed range (or just the current frame).
+    # Cap the sample count so a ~2000-frame performance doesn't hang for a
+    # minute (which reads as a freeze / "broke it"). ~800 samples is plenty for
+    # a display re-bake; auto-widen the step for very long performances.
+    MAX_SAMPLES = 800
+    if act is not None:
+        fr = act.frame_range
+        span = int(fr[1]) - int(fr[0])
+        step = max(1, int(frame_step))
+        if span // step > MAX_SAMPLES:
+            step = max(step, span // MAX_SAMPLES + 1)
+        frames = list(range(int(fr[0]), int(fr[1]) + 1, step))
+        if not frames:
+            frames = [int(fr[0])]
+    else:
+        frames = [bpy.context.scene.frame_current]
+
+    scene = bpy.context.scene
+    saved = scene.frame_current
+
+    # 1. capture deform_b per frame (armature space)
+    deform = {f: {} for f in frames}
+    for f in frames:
+        scene.frame_set(f)
+        bpy.context.view_layer.update()
+        for pb in arm.pose.bones:
+            b = arm.data.bones[pb.name]
+            deform[f][pb.name] = pb.matrix @ b.matrix_local.inverted()
+
+    # which bones carried a location track (keep re-keying those; root motion)
+    loc_bones = set()
+    if act is not None:
+        for fc in act.fcurves:
+            if fc.data_path.endswith(".location"):
+                try:
+                    loc_bones.add(fc.data_path.split('"')[1])
+                except IndexError:
+                    pass
+
+    # 2. reorient: tail -> nearest child head (connect the chain)
+    prev_mode = arm.mode
+    bpy.ops.object.mode_set(mode='EDIT')
+    ebs = arm.data.edit_bones
+    child_of = {}
+    for eb in ebs:
+        if eb.parent:
+            child_of.setdefault(eb.parent.name, []).append(eb.name)
+    for eb in ebs:
+        kids = child_of.get(eb.name)
+        if not kids:
+            continue
+        ch = min(kids, key=lambda k: (ebs[k].head - eb.head).length)
+        chead = ebs[ch].head.copy()
+        if (chead - eb.head).length > 1e-4:
+            eb.tail = chead
+    # NOTE: do NOT set use_connect — a connected bone locks its head to the
+    # parent tail and IGNORES its location channel, which the re-pose needs
+    # (reorienting shifts each bone's rest-relative offset). The tail-at-child-
+    # head already gives the visually-connected look.
+    bpy.ops.object.mode_set(mode='OBJECT')
+    bpy.context.view_layer.update()
+
+    # 3. re-pose: for each frame the desired armature-space pose of bone b is
+    #    target_b = deform_b . new_rest_b (preserves the deform => mesh). Set it
+    #    with pose_bone.matrix (hierarchy order) and capture with Blender's own
+    #    keyframe_insert — reliable; a manual fcurve .co bake evaluates wrong.
+    if act is not None:
+        # Compute each bone's matrix_basis ANALYTICALLY (fast; verified to match
+        # Blender's own pose_bone.matrix setter). target_b = deform_b.new_rest_b.
+        rest_rel = {}
+        for b in arm.data.bones:
+            rest_rel[b.name] = (b.parent.matrix_local.inverted() @ b.matrix_local
+                                if b.parent else b.matrix_local.copy())
+        keys = {name: [] for name in order}   # name -> [(f, quat, loc)]
+        for f in frames:
+            computed = {}
+            for name in order:
+                b = arm.data.bones[name]
+                target = deform[f][name] @ b.matrix_local
+                computed[name] = target
+                base = (computed[b.parent.name] @ rest_rel[name]
+                        if b.parent is not None else rest_rel[name])
+                basis = base.inverted() @ target
+                keys[name].append((f, basis.to_quaternion(),
+                                   basis.to_translation()))
+
+        # Rebuild the action with keyframe_insert (reliable — a manual fcurve
+        # .co bake evaluates wrong). Set each bone's basis then insert it with
+        # NO depsgraph update in the loop, so the accumulating action can't
+        # re-apply partial keys over the basis we're capturing.
+        for pb in arm.pose.bones:
+            pb.rotation_mode = 'QUATERNION'
+        meta = {k: act[k] for k in act.keys()}
+        oldname = act.name
+        arm.animation_data.action = None
+        bpy.data.actions.remove(act)
+        newact = bpy.data.actions.new(oldname)
+        for k, v in meta.items():
+            newact[k] = v
+        arm.animation_data.action = newact
+        nfr = len(frames)
+        for fi in range(nfr):
+            for name in order:
+                f, q, l = keys[name][fi]
+                pb = arm.pose.bones[name]
+                pb.rotation_quaternion = q
+                pb.location = l
+                pb.keyframe_insert("rotation_quaternion", frame=f, group=name)
+                pb.keyframe_insert("location", frame=f, group=name)
+    else:
+        # static rig: at rest the deform is identity, so reorienting alone left
+        # the mesh unchanged — nothing to re-pose.
+        pass
+
+    scene.frame_set(saved)
+    bpy.context.view_layer.update()
+
+    n_conn = sum(1 for b in arm.data.bones
+                 if b.parent and (b.head_local - b.parent.tail_local).length < 0.5)
+    n_tot = sum(1 for b in arm.data.bones if b.parent)
+    arm["igb_bones_connected"] = True
+    return n_conn, n_tot
+
+
+class ACTOR_OT_connect_bones(Operator):
+    """Reorient the active rig's bones so they connect head-to-tail (the clean
+    'connected' look) without changing the mesh or the animation. If the rig has
+    an active performance it is re-baked to stay pixel-identical. Note: this
+    reorients the skeleton for VIEWING/EDITING — re-import the model for a clean
+    export rig"""
+    bl_idname = "actor.connect_bones"
+    bl_label = "Connect Bones (display)"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    frame_step: IntProperty(
+        name="Frame Step", default=1, min=1, max=10,
+        description="Sample every Nth frame when re-baking an animation "
+                    "(higher = faster, less precise)")
+
+    @classmethod
+    def poll(cls, context):
+        ao = context.active_object
+        if ao is not None and (ao.type == 'ARMATURE'
+                               or (ao.parent and ao.parent.type == 'ARMATURE')):
+            return True
+        props = context.scene.igb_actor
+        return bool(props.active_armature
+                    and props.active_armature in bpy.data.objects)
+
+    def execute(self, context):
+        props = context.scene.igb_actor
+        # Prefer the armature the user actually SELECTED (viewport), then a
+        # selected child's parent, then the addon's active_armature. Using the
+        # stale active_armature first would connect the wrong character in a
+        # multi-actor scene (e.g. a briefing).
+        arm = None
+        ao = context.active_object
+        if ao is not None:
+            if ao.type == 'ARMATURE':
+                arm = ao
+            elif ao.parent is not None and ao.parent.type == 'ARMATURE':
+                arm = ao.parent
+        if arm is None:
+            for o in context.selected_objects:
+                if o.type == 'ARMATURE':
+                    arm = o
+                    break
+                if o.parent is not None and o.parent.type == 'ARMATURE':
+                    arm = o.parent
+                    break
+        if arm is None and props.active_armature:
+            arm = bpy.data.objects.get(props.active_armature)
+        if arm is None or arm.type != 'ARMATURE':
+            self.report({'ERROR'}, "Select the mocap model (its armature or "
+                        "mesh) in the viewport first")
+            return {'CANCELLED'}
+        # make it active for edit-mode ops
+        context.view_layer.objects.active = arm
+        try:
+            nc, nt = _connect_armature_bones(arm, frame_step=self.frame_step,
+                                             report=self)
+        except Exception as exc:
+            import traceback
+            traceback.print_exc()
+            self.report({'ERROR'}, f"Connect bones failed: {exc}")
+            return {'CANCELLED'}
+        self.report({'INFO'},
+                    f"Connected {nc}/{nt} bones on {arm.name} "
+                    f"(mesh + animation preserved). Branch bones stay split.")
+        return {'FINISHED'}
+
+
+class ACTOR_OT_load_mocap_performances(Operator, ImportHelper):
+    """Direct-apply every performance from a zone mocap file onto the active
+    65-bone mocap model — no retarget. Each performance becomes an Action;
+    pick one from the Action editor. Use on a mocap model (skin 200xx) whose
+    skeleton matches the zone file"""
+    bl_idname = "actor.load_mocap_performances"
+    bl_label = "Load Performances onto Model"
+    bl_options = {'REGISTER', 'UNDO'}
+    filename_ext = ".igb"
+    filter_glob: StringProperty(default="*.igb", options={'HIDDEN'})
+
+    strip_root_motion: BoolProperty(
+        name="Strip Root Motion", default=True,
+        description="Drop the performance's root translation so the model "
+                    "stays in place (pose only)")
+
+    @classmethod
+    def poll(cls, context):
+        props = context.scene.igb_actor
+        arm = (bpy.data.objects.get(props.active_armature)
+               if props.active_armature else None)
+        return arm is not None and arm.type == 'ARMATURE'
+
+    def execute(self, context):
+        from ..igb_format.igb_reader import IGBReader
+        from .sg_skeleton import extract_skeleton
+        from .sg_animation import extract_animations
+        from .animation_builder import build_action
+
+        props = context.scene.igb_actor
+        tgt = bpy.data.objects.get(props.active_armature)
+        if tgt is None or tgt.type != 'ARMATURE':
+            self.report({'ERROR'}, "Load / select a mocap model first "
+                        "(its armature must be the active actor)")
+            return {'CANCELLED'}
+
+        # Parse the zone performances.
+        try:
+            r = IGBReader(self.filepath)
+            r.read()
+            skel = extract_skeleton(r)
+            anims = extract_animations(r, skel) if skel else []
+        except Exception as exc:
+            import traceback
+            traceback.print_exc()
+            self.report({'ERROR'}, f"Could not read performances: {exc}")
+            return {'CANCELLED'}
+        if not anims:
+            self.report({'ERROR'}, "No performances found in file")
+            return {'CANCELLED'}
+
+        # Ref armature from the zone file (rebases the unanimated root).
+        try:
+            ref = _build_anim_ref_armature(context, self.filepath)
+        except Exception:
+            ref = None
+
+        n = 0
+        first = None
+        try:
+            for pa in anims:
+                act = build_action(tgt, pa, bind_pose=None,
+                                   anim_armature=ref,
+                                   rebase_unanimated_parents=ref is not None,
+                                   relative_translation=True,
+                                   root_motion_mode=('vertical'
+                                                     if self.strip_root_motion
+                                                     else 'full'))
+                if act is None:
+                    continue
+                if first is None:
+                    first = act
+                n += 1
+        finally:
+            if ref is not None:
+                _remove_anim_ref_armature(ref)
+
+        if first is not None:
+            if tgt.animation_data is None:
+                tgt.animation_data_create()
+            tgt.animation_data.action = first
+            # extend the timeline to the performance + jump to a posed frame,
+            # else the default 1..250 range hides most of the ~2000f perf.
+            try:
+                end = int(first.frame_range[1])
+                if end > 1:
+                    context.scene.frame_start = 1
+                    context.scene.frame_end = end
+                    context.scene.frame_set(max(1, min(end, int(end * 0.35))))
+            except Exception:
+                pass
+        self.report({'INFO'},
+                    f"Applied {n} performance(s) onto {tgt.name} (direct). "
+                    f"Pick one in the Action editor; timeline set to the "
+                    f"performance length.")
+        return {'FINISHED'}
+
+
 class ACTOR_OT_export_anim_from_scratch(Operator, ExportHelper):
     """Export current animation as a new IGB file (from scratch, no template needed)"""
     bl_idname = "actor.export_anim_scratch"
@@ -2878,6 +4202,12 @@ def _role_map_node(mat, role):
     grp = _igb_group_node(mat)
     if grp is None:
         return None
+    if role in ('diffuse', 'base'):
+        inp = grp.inputs.get('Base Texture')
+        if (inp and inp.is_linked
+                and inp.links[0].from_node.type == 'TEX_IMAGE'):
+            return inp.links[0].from_node
+        return None
     if role == 'normal':
         inp = grp.inputs.get('Normal')
         if inp and inp.is_linked:
@@ -2911,16 +4241,19 @@ class ACTOR_OT_add_material_map(Operator):
     bl_options = {'REGISTER', 'UNDO'}
 
     material_name: StringProperty()
-    role: EnumProperty(items=[('normal', "Normal", ""),
+    role: EnumProperty(items=[('diffuse', "Base Color", ""),
+                              ('normal', "Normal", ""),
                               ('specular', "Specular", ""),
                               ('gloss', "Gloss/Mask", "")])
 
     # Which group-node input each role feeds, and the vertical offset used
     # to lay the new Image Texture node out tidily in the shader editor.
-    _ROLE_SOCKET = {'normal': 'Normal',
+    _ROLE_SOCKET = {'diffuse': 'Base Texture',
+                    'normal': 'Normal',
                     'specular': 'Specular Texture',
                     'gloss': 'Gloss/Mask Texture'}
-    _ROLE_OFFSET = {'normal': 250, 'specular': 420, 'gloss': 590}
+    _ROLE_OFFSET = {'diffuse': 80, 'normal': 250, 'specular': 420,
+                    'gloss': 590}
 
     def execute(self, context):
         mat = bpy.data.materials.get(self.material_name)
@@ -2943,7 +4276,8 @@ class ACTOR_OT_add_material_map(Operator):
             return {'CANCELLED'}
         nt = mat.node_tree
         tex = nt.nodes.new('ShaderNodeTexImage')
-        tex.label = self.role.capitalize() + " Map"
+        tex.label = ("Base Color" if self.role == 'diffuse'
+                     else self.role.capitalize() + " Map")
         try:
             tex.image = None
         except Exception:
@@ -2963,13 +4297,14 @@ class ACTOR_OT_add_material_map(Operator):
 
 
 class ACTOR_OT_clear_material_map(Operator):
-    """Remove this material's Normal / Specular / Gloss map node(s)."""
+    """Remove this material's Base Color / Normal / Specular / Gloss map node."""
     bl_idname = "actor.clear_material_map"
     bl_label = "Remove Map"
     bl_options = {'REGISTER', 'UNDO'}
 
     material_name: StringProperty()
-    role: EnumProperty(items=[('normal', "Normal", ""),
+    role: EnumProperty(items=[('diffuse', "Base Color", ""),
+                              ('normal', "Normal", ""),
                               ('specular', "Specular", ""),
                               ('gloss', "Gloss/Mask", "")])
 
@@ -3130,7 +4465,10 @@ _classes = (
     ACTOR_OT_set_animation,
     ACTOR_OT_rest_pose,
     ACTOR_OT_play_animation,
+    ACTOR_OT_set_target_game,
+    ACTOR_OT_convert_skin_materials,
     ACTOR_OT_export_skin,
+    ACTOR_OT_export_mannequin,
     ACTOR_OT_export_animations,
     ACTOR_OT_setup_skin,
     ACTOR_OT_add_mesh_as_skin,
@@ -3143,6 +4481,15 @@ _classes = (
     ACTOR_OT_toggle_segment,
     ACTOR_OT_setup_vmc4b,
     ACTOR_OT_cleanup_vmc,
+    ACTOR_OT_vr_retarget,
+    ACTOR_OT_import_mocap,
+    ACTOR_OT_retarget_mocap,
+    ACTOR_OT_export_mocap,
+    ACTOR_OT_load_mocap_performances,
+    ACTOR_OT_convert_normal_mua,
+    ACTOR_OT_mirror_weights,
+    ACTOR_OT_connect_bones,
+    ACTOR_OT_load_briefing,
     ACTOR_OT_export_anim_from_scratch,
     ACTOR_OT_convert_animation,
 )

@@ -333,6 +333,16 @@ class SkinBuilderV4:
         self._obj_list = []      # ('obj', mo_idx, fields) | ('mem', tag, data, align)
         self._mode = actor_graph if actor_graph in ('ANIM', 'FULL') else 'ANIM'
         self._use_normal_maps = bool(use_normal_maps)
+        # Use the DXT multi-bind (diffuse/normal/spec/gloss) path whenever
+        # normal maps were requested OR any submesh carries a specular/gloss
+        # (or normal) map. This lets specular ship WITHOUT a normal — the vertex
+        # tangent frame (below, keyed on _use_normal_maps) is only added when a
+        # normal is actually present, since specular/gloss need no tangents.
+        self._use_dxt_maps = bool(use_normal_maps) or any(
+            (not s.get('is_outline'))
+            and (s.get('normal_levels') or s.get('specular_levels')
+                 or s.get('gloss_levels'))
+            for s in submeshes)
 
         skin_name = export_name or skeleton_data.get('name', 'skin')
         bones = skeleton_data['bones']
@@ -354,7 +364,7 @@ class SkinBuilderV4:
                 if sub.get('material'):
                     outline_material = sub['material']
                 continue
-            if self._use_normal_maps:
+            if self._use_dxt_maps:
                 continue  # DXT binds built per-submesh in the unit loop
             key = sub.get('texture_name', '') or ''
             if key in tex_chain_map or not sub.get('clut_data'):
@@ -374,17 +384,20 @@ class SkinBuilderV4:
             the material has a gloss image and its 'Use Gloss/Mask Map' toggle
             is on, so non-gloss materials emit no extra bind.
             """
-            specs = [(sub.get('texture_levels'), base_name, 0),
-                     (sub.get('normal_levels'), base_name + '_n', 1),
-                     (sub.get('specular_levels'), base_name + '_s', 2),
-                     (sub.get('gloss_levels'), base_name + '_g', 5)]
+            # Per-unit pfmt: diffuse/specular/gloss = DXT1 (14) when opaque (set by
+            # the exporter), normal = ALWAYS DXT5 (16, alpha carries X). Matches
+            # native (diffuse+spec DXT1, normal DXT5).
+            specs = [(sub.get('texture_levels'), base_name, 0, sub.get('diffuse_pfmt', 16)),
+                     (sub.get('normal_levels'), base_name + '_n', 1, 16),
+                     (sub.get('specular_levels'), base_name + '_s', 2, sub.get('specular_pfmt', 16)),
+                     (sub.get('gloss_levels'), base_name + '_g', 5, sub.get('gloss_pfmt', 16))]
             binds = []
-            for levels, nm, unit in specs:
+            for levels, nm, unit, pfmt in specs:
                 if not levels:
                     continue
                 ck = (nm, unit)
                 if ck not in self._dxt_cache:
-                    self._dxt_cache[ck] = self._build_dxt_chain(levels, nm, unit)
+                    self._dxt_cache[ck] = self._build_dxt_chain(levels, nm, unit, pfmt=pfmt)
                 if self._dxt_cache[ck] is not None:
                     binds.append((self._dxt_cache[ck], unit))
             return binds
@@ -422,7 +435,7 @@ class SkinBuilderV4:
                 outline_material if is_outline else _default_material())
             if is_outline:
                 chain = None
-            elif self._use_normal_maps:
+            elif self._use_dxt_maps:
                 base = (sub.get('texture_name', '') or segment_name or skin_name)
                 binds = _dxt_binds(sub, base)
                 chain = binds or None
@@ -708,12 +721,20 @@ class SkinBuilderV4:
         return attrs
 
     def _build_material(self, mat):
+        # Shininess is the specular EXPONENT. 0 means (R·V)^0 = 1 everywhere, so
+        # the specular map is applied at FULL strength across the whole surface —
+        # the "VERY shiny in advanced lighting" look. Converted materials arrive
+        # with shininess 0 (the extract default), which the get()-fallback below
+        # never overrides, so floor any near-zero value to the native 1.28.
+        _sh = float(mat.get('shininess', 1.28) or 0.0)
+        if _sh < 0.5:
+            _sh = 1.28
         return self._add_obj(MO_MATERIAL, [
             # base Short lives at slot 3 on v4 (vs 2 on v6/v8); native v4 = 1.
             (3, int(mat.get('priority', 1)), 'Short', 2),
             # Native MUA skins use shininess 1.28 (decoded from 0104); 12.8 was
             # 10x too sharp for the ASP gloss/rim highlight exponent.
-            (4, float(mat.get('shininess', 1.28)), 'Float', 4),
+            (4, _sh, 'Float', 4),
             (5, tuple(mat.get('diffuse', (1.0, 1.0, 1.0, 1.0))), 'Vec4f', 16),
             (6, tuple(mat.get('ambient', (0.588, 0.588, 0.588, 1.0))), 'Vec4f', 16),
             (7, tuple(mat.get('specular', (0.0, 0.0, 0.0, 0.0))), 'Vec4f', 16),

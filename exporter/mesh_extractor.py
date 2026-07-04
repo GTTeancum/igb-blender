@@ -43,7 +43,27 @@ class MeshExport:
         self.blend_indices = []
 
 
-def extract_mesh(bl_object, uv_v_flip=True):
+def _bake_world_matrix(bl_mesh, world_matrix):
+    """Bake an object's world matrix into a (temporary) evaluated mesh.
+
+    Applies the full transform so the exported geometry sits at its world
+    position/orientation/scale — needed when exporting a mesh whose object
+    carries a non-identity transform (e.g. an FBX prop imported with a
+    +90°X object rotation, or a posed armature-child at a world offset).
+    A negative-determinant matrix (mirrored/negative-scale object) reverses
+    winding, so flip normals to keep faces + lighting correct.
+
+    Safe on the temp mesh from Object.to_mesh(): it is discarded afterwards,
+    so the source object's mesh data is untouched.
+    """
+    if world_matrix is None:
+        return
+    bl_mesh.transform(world_matrix)
+    if world_matrix.determinant() < 0.0:
+        bl_mesh.flip_normals()
+
+
+def extract_mesh(bl_object, uv_v_flip=True, world_matrix=None):
     """Extract mesh data from a Blender object (all materials combined).
 
     Creates a MeshExport with unique vertices split wherever UVs or normals
@@ -52,6 +72,9 @@ def extract_mesh(bl_object, uv_v_flip=True):
     Args:
         bl_object: Blender mesh object (bpy.types.Object with type=='MESH')
         uv_v_flip: if True, apply v = 1.0 - v for DirectX convention (default True)
+        world_matrix: optional 4x4 Matrix to bake into the geometry (world
+            transform). None (default) keeps local coords — the map exporter's
+            historical behavior.
 
     Returns:
         MeshExport instance with all data populated
@@ -73,12 +96,13 @@ def extract_mesh(bl_object, uv_v_flip=True):
         raise ValueError(f"Could not get mesh data from '{bl_object.name}'")
 
     try:
+        _bake_world_matrix(bl_mesh, world_matrix)
         return _extract_from_mesh(bl_mesh, bl_object.name, uv_v_flip)
     finally:
         eval_obj.to_mesh_clear()
 
 
-def extract_mesh_per_material(bl_object, uv_v_flip=True):
+def extract_mesh_per_material(bl_object, uv_v_flip=True, world_matrix=None):
     """Extract per-material submeshes from a Blender object.
 
     Splits the mesh by material slot. Each returned MeshExport contains only
@@ -88,6 +112,8 @@ def extract_mesh_per_material(bl_object, uv_v_flip=True):
     Args:
         bl_object: Blender mesh object (bpy.types.Object with type=='MESH')
         uv_v_flip: if True, apply v = 1.0 - v for DirectX convention
+        world_matrix: optional 4x4 Matrix to bake into the geometry (world
+            transform). None (default) keeps local coords.
 
     Returns:
         list of MeshExport, one per material slot that has geometry.
@@ -111,6 +137,7 @@ def extract_mesh_per_material(bl_object, uv_v_flip=True):
         raise ValueError(f"Could not get mesh data from '{bl_object.name}'")
 
     try:
+        _bake_world_matrix(bl_mesh, world_matrix)
         bl_mesh.calc_loop_triangles()
         loop_tris = bl_mesh.loop_triangles
 

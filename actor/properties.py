@@ -218,6 +218,60 @@ class ACTOR_SceneProperties(PropertyGroup):
         default="",
     )
 
+    # --- VR / mocap retarget ---
+    vr_source_armature: StringProperty(
+        name="Source (VR) Armature",
+        description="The Unity-named armature your VR / mocap addon drives. "
+                    "Its recorded motion is retargeted onto the loaded actor",
+        default="",
+    )
+
+    vr_root_motion: BoolProperty(
+        name="Bake Hip Motion",
+        description="Carry the performer's hip translation (crouch / lean / "
+                    "jump) onto the Pelvis, scaled to the character. Turn off "
+                    "for in-place idles and gestures",
+        default=True,
+    )
+
+    vr_use_action_range: BoolProperty(
+        name="Use Source Action Range",
+        description="Sample the source armature's active Action range instead "
+                    "of the scene frame range",
+        default=True,
+    )
+
+    vr_frame_start: IntProperty(
+        name="Start", description="First frame to bake", default=1, min=0)
+    vr_frame_end: IntProperty(
+        name="End", description="Last frame to bake", default=60, min=0)
+
+    # --- Mocap studio (import / retarget / export the zone-style mocap) ---
+    mocap_source_armature: StringProperty(
+        name="Mocap Rig",
+        description="The imported mocap performance rig (e.g. a zone_briefing "
+                    "file) whose active performance will drive the character",
+        default="")
+
+    mocap_full_range: BoolProperty(
+        name="Bake Whole Performance",
+        description="Retarget the entire performance. Turn off to bake just a "
+                    "frame range (these performances can be ~2000 frames)",
+        default=False)
+
+    mocap_frame_start: IntProperty(
+        name="Start", description="First frame of the performance to bake",
+        default=0, min=0)
+    mocap_frame_end: IntProperty(
+        name="End", description="Last frame of the performance to bake",
+        default=300, min=0)
+
+    mocap_root_motion: BoolProperty(
+        name="Bake Root Motion",
+        description="Carry the performer's hip translation onto the character "
+                    "(walking / stepping). Off = in-place",
+        default=True)
+
     show_material_colors: BoolProperty(
         name="Material Colors",
         description="Show the diffuse/ambient/specular/emission color editor",

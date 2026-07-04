@@ -102,6 +102,8 @@ def build_light(parsed_light, name="IGB_Light"):
     light_obj["ig_specular"] = list(parsed_light.specular)
     light_obj["ig_attenuation"] = list(parsed_light.attenuation)
     light_obj["ig_shininess"] = parsed_light.shininess
+    # raw intensity for the game-shading energy conversion (mapmaker/game_shading.py)
+    light_obj["ig_diffuse_max"] = max_channel
 
     return light_obj
 

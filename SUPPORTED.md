@@ -60,7 +60,7 @@ Last updated: 2026-03-17
 
 | Type | Description | Priority |
 |------|-------------|----------|
-| igFogAttr / igFogStateAttr | Distance fog | High |
+| igFogAttr / igFogStateAttr | Distance fog | N/A — verified UNUSED by XML1/XML2/MUA maps: in these games "fog" is particle effects via `actionent` + `loopfx` entities (e.g. `map/common/weather_jungle`), not render-state fog |
 | igDepthStateAttr | Z-buffer control | Medium |
 | igDepthWriteStateAttr | Z-write disable (transparent overlays) | Medium |
 | igDepthFunctionAttr | Depth test comparison | Low |
