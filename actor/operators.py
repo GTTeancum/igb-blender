@@ -965,6 +965,90 @@ def _mannequin_meshes(context):
     return [], None
 
 
+def _mirror_counterpart(name):
+    """Game-rig L/R counterpart: 'Bip01 L Hand' <-> 'Bip01 R Hand'.
+
+    Blender's own flip tooling only understands .L/.R style suffixes, not
+    the ' L ' / ' R ' infix every XML/MUA rig uses — so X-mirror posing has
+    never worked on these rigs.
+    """
+    for a, b in ((" L ", " R "), (" R ", " L ")):
+        if a in name:
+            return name.replace(a, b, 1)
+    for a, b in ((" L", " R"), (" R", " L")):
+        if name.endswith(a):
+            return name[: -len(a)] + b
+    return None  # center bone
+
+
+class ACTOR_OT_mirror_pose(Operator):
+    """Mirror the current pose left<->right (game 'Bip01 L/R' bone naming)"""
+    bl_idname = "actor.mirror_pose"
+    bl_label = "Mirror Pose L↔R"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    selected_only: BoolProperty(
+        name="Selected Bones Only",
+        description="Mirror only the selected bones (and their counterparts)",
+        default=False,
+    )
+
+    @classmethod
+    def poll(cls, context):
+        return (context.active_object is not None
+                and context.active_object.type == 'ARMATURE'
+                and context.mode == 'POSE')
+
+    def execute(self, context):
+        from mathutils import Matrix
+        arm = context.active_object
+        M = Matrix.Diagonal((-1.0, 1.0, 1.0, 1.0))
+
+        bones = list(arm.pose.bones)
+        if self.selected_only:
+            sel = {pb.name for pb in bones if pb.bone.select}
+            for n in list(sel):
+                cp = _mirror_counterpart(n)
+                if cp:
+                    sel.add(cp)
+            bones = [pb for pb in bones if pb.name in sel]
+
+        # Snapshot armature-space matrices FIRST (assignments change children)
+        snap = {pb.name: pb.matrix.copy() for pb in arm.pose.bones}
+
+        # Target matrix per bone: mirrored counterpart's pose (or own, for
+        # center bones). W' = M @ W @ M reflects across the X=0 plane while
+        # keeping a right-handed frame.
+        targets = {}
+        for pb in bones:
+            src_name = _mirror_counterpart(pb.name) or pb.name
+            src = snap.get(src_name)
+            if src is None:
+                continue
+            targets[pb.name] = M @ src @ M
+
+        # Apply parents-first so pose_bone.matrix conversion sees updated
+        # parents.
+        def depth(pb):
+            d, p = 0, pb.parent
+            while p is not None:
+                d += 1
+                p = p.parent
+            return d
+
+        n_applied = 0
+        for pb in sorted(bones, key=depth):
+            t = targets.get(pb.name)
+            if t is None:
+                continue
+            pb.matrix = t
+            context.view_layer.update()
+            n_applied += 1
+
+        self.report({'INFO'}, f"Mirrored {n_applied} bones")
+        return {'FINISHED'}
+
+
 class ACTOR_OT_export_mannequin(Operator, ExportHelper):
     """Export the selected model as a STATIC mannequin IGB.
 
@@ -4489,6 +4573,7 @@ _classes = (
     ACTOR_OT_convert_normal_mua,
     ACTOR_OT_mirror_weights,
     ACTOR_OT_connect_bones,
+    ACTOR_OT_mirror_pose,
     ACTOR_OT_load_briefing,
     ACTOR_OT_export_anim_from_scratch,
     ACTOR_OT_convert_animation,

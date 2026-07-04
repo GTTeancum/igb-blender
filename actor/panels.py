@@ -1271,6 +1271,12 @@ class MOCAP_PT_Models(Panel):
                      icon='CONSTRAINT_BONE')
         box.label(text="Connects the chain; mesh + anim kept.", icon='INFO')
 
+        box = layout.box()
+        box.label(text="4. Posing", icon='ARMATURE_DATA')
+        box.operator("actor.mirror_pose", text="Mirror Pose L↔R",
+                     icon='MOD_MIRROR')
+        box.label(text="Works with game 'Bip01 L/R' names", icon='INFO')
+
 
 class MOCAP_PT_Retarget(Panel):
     """Retarget a performance onto a DIFFERENT / custom character (for skins

@@ -210,7 +210,58 @@ def build_armature(context, skeleton, armature_name=None, collection=None,
             pb["igb_flags"] = bone.flags
             pb.rotation_mode = 'QUATERNION'
 
+    _assign_bone_collections(arm_obj, skeleton)
+
     return arm_obj
+
+
+def _assign_bone_collections(arm_obj, skeleton):
+    """Organize bones into named collections by their game role.
+
+    Roles come from the igSkeletonBoneInfo flags (0x40 = helper such as the
+    root 'Unnamed bone' and fx01-fx04 attachment points; 0x42 = the 'Motion'
+    root-motion extraction bone) plus name conventions (Nub end-caps,
+    Footsteps). Deforming bones (bmIdx >= 0) go to Deform. Makes 40-60-bone
+    game rigs scannable and lets users hide the helpers with one click.
+    """
+    try:
+        colls = {}
+
+        def coll(name):
+            if name not in colls:
+                c = arm_obj.data.collections.get(name)
+                colls[name] = c or arm_obj.data.collections.new(name)
+            return colls[name]
+
+        palette = {"Deform": 'THEME01', "Helpers": 'THEME09',
+                   "Motion": 'THEME03', "Attach (fx)": 'THEME04'}
+        for bone in skeleton.bones:
+            name = bone.name if bone.name else f"Bone_{bone.index:03d}"
+            b = arm_obj.data.bones.get(name)
+            if b is None:
+                continue
+            lname = name.lower()
+            if bone.flags & 0x02 and lname == "motion" or lname == "motion":
+                group = "Motion"
+            elif lname.startswith("fx"):
+                group = "Attach (fx)"
+            elif (bone.flags & 0x40 or lname.endswith("nub")
+                  or "footsteps" in lname or name.startswith("Unnamed")):
+                group = "Helpers"
+            elif skeleton.get_effective_bm_idx(bone.index) >= 0:
+                group = "Deform"
+            else:
+                group = "Helpers"
+            coll(group).assign(b)
+            pb = arm_obj.pose.bones.get(name)
+            if pb is not None:
+                try:
+                    pb.color.palette = palette.get(group, 'DEFAULT')
+                except Exception:
+                    pass
+    except Exception:
+        # cosmetic only — never fail an import over collections
+        pass
 
 
 def _compute_oriented_positions(skeleton, bind_pose):
