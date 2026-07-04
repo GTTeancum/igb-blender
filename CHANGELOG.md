@@ -57,6 +57,21 @@ The "maps play like the game" release.
   in the moveset, hold that animation's final pose.
 - 62-animation regression matrix across XML1/XML2/MUA is green.
 
+### Actors / Armature
+- **MUA v4/v6 skin detection fixed for good**: any texture bind on unit
+  1/2/5 (normal/spec/gloss) now marks a file as MUA — validated against 120
+  XML2 files (901 binds, all unit 0). Community skins and re-imported
+  exports get correct colors, normal maps, and MUA export defaults.
+- **Bone collections**: imported rigs organize bones into Deform / Helpers /
+  Motion / Attach (fx) with colors, driven by the decoded bone flags.
+- **Mirror Pose L↔R** (IGB Actors → Posing): exact pose mirroring for the
+  games' "Bip01 L/R" naming that Blender's flip tooling can't parse.
+- **Selection sync**: clicking a skin's object or its collection in the
+  outliner points the IGB Actors tab at that skin automatically (great for
+  multi-skin .blends).
+- Armature format audit: bone flags round-trip; appearances/transition
+  lists verified empty in all 105 sampled actor files (non-features).
+
 ### Exporter
 - Per-export **size report** (textures/geometry/structure split + one hint).
   Output verified at native size parity (0101: pools byte-identical).
