@@ -240,22 +240,37 @@ def detect_profile(reader) -> GameProfile:
             # primary target and the safer default (single-sided culling).
             best_profile = GAME_PROFILES.get("xml2_pc", best_profile)
 
-    # Ambiguity fix: a v6 skin exported FOR MUA (e.g. our animated mannequins
-    # at ui/models/mannequin/<id>.igb) has the same version + classes as an
-    # XML2 PC file, so it scores as xml2_pc — but its DXT color endpoints are
-    # BGR (swap_rb) and re-import comes out with red/blue swapped. When the
-    # class signature says XML2 but the file's textures are pure MUA-style
-    # DXT1/DXT5 (pfmt 14/16 — native XML2 ships DXT3=15 and CLUT=65536) AND
-    # the path says MUA (mannequin folder / game dir), prefer the MUA profile.
+    # Ambiguity fixes: v4/v6 files authored FOR MUA (community skins, our own
+    # exports, animated mannequins) carry the same version + classes as XML2
+    # files, so they score as xml2_pc — then re-import with R/B-swapped DXT
+    # colors, an XML2 target-game tag, and XML2-style export defaults.
     if best_profile is not None and best_profile.game_id == "xml2_pc":
-        path = ""
-        try:
-            path = (getattr(reader, "filepath", "") or "").lower()
-        except Exception:
-            pass
-        path_says_mua = any(k in path for k in
+        mua = GAME_PROFILES.get("mua_pc")
+
+        # 1. CONTENT rule (path-independent, unambiguous): normal/specular/
+        #    gloss texture units (1/2/5) exist ONLY in MUA — XML2 has no
+        #    normal-map pipeline at all. Any igTextureBindAttr bound to one
+        #    of those units marks the file as MUA regardless of where it is.
+        if mua is not None:
+            s = 1 if reader.header.version <= 5 else 0
+            for obj in reader.objects:
+                try:
+                    if (hasattr(obj, "is_type")
+                            and obj.is_type(b"igTextureBindAttr")):
+                        for slot, val, fi in obj._raw_fields:
+                            if (fi.short_name == b"Int"
+                                    and val in (1, 2, 5)):
+                                return mua
+                except Exception:
+                    continue
+
+        # 2. PATH rule for the remaining single-texture ambiguity (e.g. MUA's
+        #    own v6 CLUT actors, mannequins): when the location names MUA and
+        #    the textures aren't XML2-native DXT3, prefer the MUA profile so
+        #    swap_rb + the target-game tag come out right.
+        path_says_mua = any(k in _path for k in
                             ("mannequin", "ultimate alliance", "mua"))
-        if path_says_mua:
+        if path_says_mua and mua is not None:
             pfmts = set()
             for obj in reader.objects:
                 try:
@@ -266,10 +281,11 @@ def detect_profile(reader) -> GameProfile:
                                 pfmts.add(val)
                 except Exception:
                     continue
-            if pfmts and pfmts <= {14, 16}:
-                mua = GAME_PROFILES.get("mua_pc")
-                if mua is not None:
-                    return mua
+            # DXT3 (15) is the one format ONLY XML2 uses; CLUT (65536) is
+            # platform-neutral, 14/16 are MUA-style. If nothing says
+            # "XML2 native", trust the path.
+            if 15 not in pfmts:
+                return mua
 
     return best_profile
 
