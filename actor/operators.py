@@ -166,6 +166,88 @@ def _import_anim_via_retarget(context, ref_arm, target_arm, pa, bind_pose):
     return action
 
 
+def _weighted_bone_names(rig):
+    """Bone names carrying at least one non-zero mesh weight."""
+    weighted = set()
+    for mo in rig.children:
+        if mo.type != 'MESH':
+            continue
+        idx_to_name = {vg.index: vg.name for vg in mo.vertex_groups}
+        for v in mo.data.vertices:
+            for g in v.groups:
+                if g.weight > 1e-5:
+                    nm = idx_to_name.get(g.group)
+                    if nm:
+                        weighted.add(nm)
+    return weighted
+
+
+def fix_rig_root(context, rig, ref, tol_deg=3.0, tol_head=1.0):
+    """Snap the rig's mismatched UNWEIGHTED bones to the reference game
+    skeleton, so game animations play NATIVELY (no retargeting).
+
+    A Rig Converter output / cross-game import can have its root chain
+    (Bone_000, Bip01) rotated off the game skeleton while everything below
+    the pelvis already matches. Those root bones carry no mesh weights, so
+    re-orienting them to the game skeleton fixes animation playback without
+    moving a single vertex — the rig becomes a proper game skeleton.
+
+    Returns (n_fixed, clean):
+      - n_fixed: how many bones were snapped.
+      - clean: False if a WEIGHTED bone also differs (can't fix it without
+        deforming the mesh) — the caller should fall back to retargeting.
+    """
+    import math as _math
+    from mathutils import Quaternion as _Q
+
+    weighted = _weighted_bone_names(rig)
+    rig_mw3 = rig.matrix_world.to_3x3()
+    ref_mw3 = ref.matrix_world.to_3x3()
+
+    to_fix = []
+    blocked = []
+    for rb in ref.data.bones:
+        tb = rig.data.bones.get(rb.name)
+        if tb is None:
+            continue
+        rq = (rig_mw3 @ tb.matrix_local.to_3x3()).to_quaternion()
+        fq = (ref_mw3 @ rb.matrix_local.to_3x3()).to_quaternion()
+        ang = _math.degrees(2.0 * _math.acos(min(1.0, abs(rq.dot(fq)))))
+        hd = ((rig.matrix_world @ tb.head_local)
+              - (ref.matrix_world @ rb.head_local)).length
+        if ang > tol_deg or hd > tol_head:
+            if rb.name in weighted:
+                blocked.append(rb.name)
+            else:
+                to_fix.append(rb.name)
+
+    if blocked:
+        # A skinned bone is off — snapping it would drag the mesh. Bail so
+        # the caller retargets instead (safe, if less clean).
+        return 0, False
+    if not to_fix:
+        return 0, True
+
+    prev_active = context.view_layer.objects.active
+    prev_mode = rig.mode
+    context.view_layer.objects.active = rig
+    bpy.ops.object.mode_set(mode='EDIT')
+    try:
+        for bn in to_fix:
+            reb = ref.data.bones[bn]
+            eb = rig.data.edit_bones.get(bn)
+            if eb is None:
+                continue
+            ln = reb.length
+            eb.matrix = reb.matrix_local.copy()   # head + orientation + roll
+            if ln > 1e-5:
+                eb.length = ln
+    finally:
+        bpy.ops.object.mode_set(mode='OBJECT')
+        context.view_layer.objects.active = prev_active
+    return len(to_fix), True
+
+
 def _remove_anim_ref_armature(arm):
     """Remove a temp anim-ref armature (object + data + its now-empty collection)."""
     try:
@@ -2403,18 +2485,30 @@ class ACTOR_OT_pick_animation(Operator):
             except Exception:
                 anim_armature = None
 
-        # Foreign-rig detection: a Rig Converter output has Bip01 bone NAMES
-        # but its own rest orientations/rolls — applying game anims through
-        # those rests directly gives a crooked lean. Route through the ref
-        # armature (native math there) + world-delta retarget instead.
-        retarget_mode = (
-            anim_armature is not None
-            and _rest_local_mismatch(armature_obj, anim_armature)
-        )
-        if retarget_mode:
-            self.report({'INFO'},
-                        "Custom rig detected — retargeting animations "
-                        "through the game skeleton")
+        # Foreign-rig detection: a Rig Converter output / cross-game import
+        # has Bip01 bone NAMES but its own root rest orientations — applying
+        # game anims through those rests gives a crooked lean on BOTH games.
+        mismatch = (anim_armature is not None
+                    and _rest_local_mismatch(armature_obj, anim_armature))
+
+        # Preferred fix: snap the rig's UNWEIGHTED root bones to the game
+        # skeleton so it becomes a proper game skeleton and anims play
+        # natively (no retarget, both games, no per-game quirks). Only the
+        # structural root (Bone_000/Bip01) is usually off and it carries no
+        # weights, so the mesh doesn't move. Falls back to retargeting when a
+        # skinned bone is off (can't snap without deforming the mesh).
+        retarget_mode = False
+        if mismatch:
+            n_fixed, clean = fix_rig_root(context, armature_obj, anim_armature)
+            if clean and n_fixed > 0:
+                self.report({'INFO'},
+                            f"Corrected rig root ({n_fixed} bone(s)) to match "
+                            f"the game skeleton — animations now play natively")
+            elif not clean:
+                retarget_mode = True
+                self.report({'INFO'},
+                            "Custom rig detected — retargeting animations "
+                            "through the game skeleton")
 
         fps = context.scene.render.fps
         imported_count = 0
@@ -2468,8 +2562,13 @@ class ACTOR_OT_pick_animation(Operator):
                         context, anim_armature, armature_obj, pa_to_build,
                         bind_pose)
                 else:
+                    # Absolute formula (bind_pose=None): each bone reaches the
+                    # game's parent-local orientation. The bind-branch maps an
+                    # anim that parks a bone at its bind (menu idles) to the
+                    # REST pose (a T-pose), so it's dropped here. On a matched
+                    # or root-corrected rig this reproduces the game pose.
                     action = build_action(armature_obj, pa_to_build,
-                                          bind_pose=bind_pose,
+                                          bind_pose=None,
                                           bone_remap=bone_remap,
                                           target_bind_pose=target_bind_pose,
                                           anim_armature=anim_armature,

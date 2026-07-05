@@ -1,6 +1,20 @@
 # Changelog
 
 ## Unreleased
+- **Root-cause fix for crooked animations on custom / cross-game rigs.**
+  A rig whose Bip01 root is rotated off the game skeleton (a Rig Converter
+  output, or an XML1-PS2 skin driven by XML2/MUA anims) played every game
+  animation tilted. Import Animations now **snaps the rig's unweighted root
+  bones (Bone_000/Bip01/Motion) to the game skeleton** — they carry no mesh
+  weights, so not a single vertex moves — turning the rig into a proper game
+  skeleton. Both XML2 and MUA then play **natively**, upright and centered,
+  with no per-game retargeting. Verified on a real cross-game Cyclops rig:
+  mesh moves 0.000, body deviation from the game pose 0.000 (XML2), and both
+  games render on-model. Falls back to retargeting only if a *skinned* bone
+  is also off (can't snap it without deforming the mesh).
+- Native animation import now uses the **absolute** pose formula (the same
+  one MUA uses) instead of the bind-branch, so menu idles no longer import
+  as a T-pose.
 - **Game animations now import correctly onto converted / cross-game rigs.**
   A rig with Bip01 bone names but different rest orientations — a Rig
   Converter output, or an XML1-PS2 skin driven by XML2-PC animations —
