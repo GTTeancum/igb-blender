@@ -18,6 +18,12 @@
   as the baseline, so a rig whose Bip01 is turned ~90° (e.g. Cyclops97
   imports) kept its arms splayed out. Absolute-match reproduces the game
   pose exactly (0.0-unit joint match). VR mocap still uses delta.
+- **Fixed menu idles importing as a T-pose on retargeted rigs.** The
+  retarget built its source pose with the bind-branch, which maps
+  "animation == bind pose" (exactly what menu idles do — they park bones at
+  the bind) to the reference's *rest* pose, i.e. a T-pose, which then got
+  copied onto the rig. It now builds the source with the absolute formula
+  (the same one MUA uses), so menu_idle resolves to its real stance.
 - **Animation export FIXED** — exported moveset .igb files were corrupt
   (every Enbaya blob's memory layout shifted; ~180° rotation errors on
   re-import). Three root causes fixed: shared memory-directory entries are

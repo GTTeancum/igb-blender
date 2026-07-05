@@ -116,7 +116,14 @@ def _import_anim_via_retarget(context, ref_arm, target_arm, pa, bind_pose):
     from .animation_builder import build_action
     from .vr_mocap import retarget_and_bake
 
-    src_action = build_action(ref_arm, pa, bind_pose=bind_pose,
+    # Build the source on the reference with the ABSOLUTE formula (bind_pose
+    # dropped), NOT the bind-branch. The bind-branch maps "anim == bind" to
+    # the reference's REST pose, so menu idles (which park bones at the bind
+    # pose) collapse to a T-pose that match_absolute then faithfully copies
+    # onto the user rig. The absolute formula puts each bone at the game's
+    # actual world orientation (conj(anim_q)) — exactly what we want to
+    # transfer, and the same path MUA already uses successfully.
+    src_action = build_action(ref_arm, pa, bind_pose=None,
                               rebase_unanimated_parents=True)
     if src_action is None:
         return None
