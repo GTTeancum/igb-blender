@@ -136,10 +136,17 @@ def _import_anim_via_retarget(context, ref_arm, target_arm, pa, bind_pose):
         f0, f1 = src_action.frame_range
         bone_map = {b.name: b.name for b in ref_arm.data.bones
                     if b.name in target_arm.data.bones}
+        # root_motion=False keeps the character grounded at its rest hip
+        # height. Baking the reference's hip world-displacement floated the
+        # rig up/off-origin (the ref armature imports at a different scale, so
+        # the transferred displacement was mis-scaled — the "not on the floor /
+        # top-right" artifact, on both games). follow_translation stays on: it
+        # reproduces the game's hip width (thigh spread matches the ref exactly;
+        # turning it off compresses the hips).
         action, n_mapped, _n_frames = retarget_and_bake(
             ref_arm, target_arm,
             int(f0), int(_math.ceil(f1)),
-            action_name=pa.name, root_motion=True, bone_map=bone_map,
+            action_name=pa.name, root_motion=False, bone_map=bone_map,
             follow_translation=True, match_absolute=True)
     finally:
         ref_arm.animation_data.action = prev_action

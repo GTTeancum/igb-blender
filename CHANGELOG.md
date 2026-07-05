@@ -24,6 +24,11 @@
   the bind) to the reference's *rest* pose, i.e. a T-pose, which then got
   copied onto the rig. It now builds the source with the absolute formula
   (the same one MUA uses), so menu_idle resolves to its real stance.
+- Retargeted anims no longer **float off the floor / drift to a corner**
+  (both games). The reference armature imports at a different scale, so
+  baking its hip world-displacement mis-scaled the character up and off
+  origin. The retarget now keeps the rig grounded at its rest hip height;
+  per-bone translation (correct hip width) is preserved.
 - **Animation export FIXED** — exported moveset .igb files were corrupt
   (every Enbaya blob's memory layout shifted; ~180° rotation errors on
   re-import). Three root causes fixed: shared memory-directory entries are
