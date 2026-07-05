@@ -49,17 +49,25 @@ def _build_anim_ref_armature(context, anim_filepath):
     return res[0]
 
 
-def _rest_local_mismatch(target_arm, ref_arm, tol_deg=3.0, frac=0.25):
+def _rest_local_mismatch(target_arm, ref_arm, tol_deg=3.0, frac=0.25,
+                         hi_deg=10.0):
     """True when target_arm's bone rests don't match the anim skeleton's.
 
     Game-imported actors match the anim file's skeleton (same rig), but a
-    Rig Converter output keeps its own bone rolls/orientations under Bip01
-    names — applying game anims through those rests directly produces the
+    Rig Converter output — or a cross-game import (an XML1-PS2 skin driven
+    by XML2-PC anims) — keeps its own bone rest orientations under Bip01
+    names. Applying game anims through those rests directly produces the
     "crooked lean". Detection compares parent-local rest rotations of bones
-    whose PARENT name also matches (root-chain bones are excluded: a
-    skin-built game actor legitimately differs from the anim skeleton at
-    the root, e.g. a +90X "Unnamed bone" above Bip01 — that case is native
-    and handled by the ref-armature rebase, not retargeting).
+    whose PARENT name also matches (roots are excluded: a skin-built game
+    actor legitimately differs from the anim skeleton at the root, e.g. a
+    +90X "Unnamed bone" above Bip01 — handled by the ref-armature rebase).
+
+    Fires on EITHER signal:
+      - a broad difference (>frac of comparable bones off by >tol_deg) —
+        catches a Rig Converter's uniform roll skew; OR
+      - a concentrated high-impact difference (any bone that PARENTS others
+        off by >hi_deg) — catches the XML1-PS2 Pelvis (~93deg vs XML2-PC),
+        which is only 1-2 bones but tilts the whole body hanging off it.
     """
     import math as _math
 
@@ -74,6 +82,7 @@ def _rest_local_mismatch(target_arm, ref_arm, tol_deg=3.0, frac=0.25):
 
     compared = 0
     bad = 0
+    hi_influential = False
     for rb in ref_bones:
         tb = tgt_bones.get(rb.name)
         if tb is None or rb.parent is None or tb.parent is None:
@@ -85,10 +94,15 @@ def _rest_local_mismatch(target_arm, ref_arm, tol_deg=3.0, frac=0.25):
         compared += 1
         if ang > tol_deg:
             bad += 1
+        # A large rest delta on a bone that parents a subtree propagates the
+        # error to every descendant — a handful of such bones wreck the pose
+        # even when the overall off-fraction stays low.
+        if ang > hi_deg and len(tb.children) > 0:
+            hi_influential = True
 
     if compared < 8:
         return False  # not enough shared structure to judge — stay native
-    return (bad / compared) > frac
+    return hi_influential or (bad / compared) > frac
 
 
 def _import_anim_via_retarget(context, ref_arm, target_arm, pa, bind_pose):

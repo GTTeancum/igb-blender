@@ -1,13 +1,17 @@
 # Changelog
 
 ## Unreleased
-- **Game animations now import correctly onto converted custom rigs** (Rig
-  Converter outputs). Custom rigs carry their own bone rolls/rest
-  orientations under Bip01 names — applying game anims through those rests
-  directly gave a crooked full-body lean. Import Animations now detects the
-  rest mismatch and retargets through the game skeleton (world-delta +
-  analytic FK, rotation-exact vs the game pose, custom proportions
-  preserved). Game-imported actors are unaffected (native path).
+- **Game animations now import correctly onto converted / cross-game rigs.**
+  A rig with Bip01 bone names but different rest orientations — a Rig
+  Converter output, or an XML1-PS2 skin driven by XML2-PC animations —
+  played game anims with a crooked full-body lean. Import Animations now
+  detects the rest mismatch and retargets through the game skeleton
+  (world-delta + analytic FK, rotation-exact vs the game pose, custom
+  proportions preserved). Game-imported actors are unaffected (native path).
+- The mismatch detector now also fires on a **concentrated** high-impact
+  difference — a single root bone like the Pelvis being ~90° off (XML1-PS2
+  vs XML2-PC) tilts the whole body even though only 1-2 bones differ. It
+  previously required a broad (>25% of bones) difference and missed this.
 - **Animation export FIXED** — exported moveset .igb files were corrupt
   (every Enbaya blob's memory layout shifted; ~180° rotation errors on
   re-import). Three root causes fixed: shared memory-directory entries are
