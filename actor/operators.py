@@ -228,23 +228,50 @@ def fix_rig_root(context, rig, ref, tol_deg=3.0, tol_head=1.0):
     if not to_fix:
         return 0, True
 
-    prev_active = context.view_layer.objects.active
-    prev_mode = rig.mode
-    context.view_layer.objects.active = rig
-    bpy.ops.object.mode_set(mode='EDIT')
+    # Enter edit mode on the rig to move its edit bones. pick_animation runs
+    # inside a popup-dialog context where bpy.ops.object.mode_set can't see an
+    # active object, so drive it through an explicit context override. Also
+    # unhide/select the rig (mode_set needs it visible + selectable).
+    view_layer = context.view_layer
+    prev_active = view_layer.objects.active
+    was_hidden_get = rig.hide_get()
+    was_hidden_vp = rig.hide_viewport
+    prev_selected = [o for o in context.selected_objects]
+    if rig.name not in view_layer.objects:
+        # rig lives in an excluded collection — can't edit it safely
+        return 0, False
+    rig.hide_viewport = False
+    rig.hide_set(False)
+    view_layer.objects.active = rig
+    rig.select_set(True)
+    ovr = {'active_object': rig, 'object': rig,
+           'selected_objects': [rig], 'selected_editable_objects': [rig]}
     try:
-        for bn in to_fix:
-            reb = ref.data.bones[bn]
-            eb = rig.data.edit_bones.get(bn)
-            if eb is None:
-                continue
-            ln = reb.length
-            eb.matrix = reb.matrix_local.copy()   # head + orientation + roll
-            if ln > 1e-5:
-                eb.length = ln
+        with context.temp_override(**ovr):
+            bpy.ops.object.mode_set(mode='EDIT')
+            for bn in to_fix:
+                reb = ref.data.bones[bn]
+                eb = rig.data.edit_bones.get(bn)
+                if eb is None:
+                    continue
+                ln = reb.length
+                eb.matrix = reb.matrix_local.copy()   # head + orientation + roll
+                if ln > 1e-5:
+                    eb.length = ln
+            bpy.ops.object.mode_set(mode='OBJECT')
     finally:
-        bpy.ops.object.mode_set(mode='OBJECT')
-        context.view_layer.objects.active = prev_active
+        rig.hide_viewport = was_hidden_vp
+        if was_hidden_get:
+            rig.hide_set(True)
+        for o in context.selected_objects:
+            o.select_set(False)
+        for o in prev_selected:
+            try:
+                o.select_set(True)
+            except Exception:
+                pass
+        if prev_active is not None:
+            view_layer.objects.active = prev_active
     return len(to_fix), True
 
 
@@ -2499,16 +2526,20 @@ class ACTOR_OT_pick_animation(Operator):
         # skinned bone is off (can't snap without deforming the mesh).
         retarget_mode = False
         if mismatch:
-            n_fixed, clean = fix_rig_root(context, armature_obj, anim_armature)
+            try:
+                n_fixed, clean = fix_rig_root(context, armature_obj,
+                                              anim_armature)
+            except Exception as exc:
+                # Never let a root-fix failure crash the import — retarget.
+                n_fixed, clean = 0, False
+                self.report({'WARNING'},
+                            f"Root correction skipped ({exc}); retargeting")
             if clean and n_fixed > 0:
                 self.report({'INFO'},
                             f"Corrected rig root ({n_fixed} bone(s)) to match "
                             f"the game skeleton — animations now play natively")
             elif not clean:
                 retarget_mode = True
-                self.report({'INFO'},
-                            "Custom rig detected — retargeting animations "
-                            "through the game skeleton")
 
         fps = context.scene.render.fps
         imported_count = 0
