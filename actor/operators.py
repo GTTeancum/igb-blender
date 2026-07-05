@@ -49,6 +49,91 @@ def _build_anim_ref_armature(context, anim_filepath):
     return res[0]
 
 
+def _rest_local_mismatch(target_arm, ref_arm, tol_deg=3.0, frac=0.25):
+    """True when target_arm's bone rests don't match the anim skeleton's.
+
+    Game-imported actors match the anim file's skeleton (same rig), but a
+    Rig Converter output keeps its own bone rolls/orientations under Bip01
+    names — applying game anims through those rests directly produces the
+    "crooked lean". Detection compares parent-local rest rotations of bones
+    whose PARENT name also matches (root-chain bones are excluded: a
+    skin-built game actor legitimately differs from the anim skeleton at
+    the root, e.g. a +90X "Unnamed bone" above Bip01 — that case is native
+    and handled by the ref-armature rebase, not retargeting).
+    """
+    import math as _math
+
+    tgt_bones = target_arm.data.bones
+    ref_bones = ref_arm.data.bones
+
+    def _local_q(b):
+        if b.parent:
+            return (b.parent.matrix_local.inverted()
+                    @ b.matrix_local).to_quaternion()
+        return b.matrix_local.to_quaternion()
+
+    compared = 0
+    bad = 0
+    for rb in ref_bones:
+        tb = tgt_bones.get(rb.name)
+        if tb is None or rb.parent is None or tb.parent is None:
+            continue
+        if rb.parent.name != tb.parent.name:
+            continue
+        d = abs(_local_q(rb).dot(_local_q(tb)))
+        ang = _math.degrees(2.0 * _math.acos(min(1.0, d)))
+        compared += 1
+        if ang > tol_deg:
+            bad += 1
+
+    if compared < 8:
+        return False  # not enough shared structure to judge — stay native
+    return (bad / compared) > frac
+
+
+def _import_anim_via_retarget(context, ref_arm, target_arm, pa, bind_pose):
+    """Import a game anim onto a FOREIGN rig (Rig Converter output).
+
+    Applies the anim natively to the reference armature (whose rests match
+    the anim file exactly), then world-delta retargets + bakes onto the
+    target rig by matching bone names. Returns the baked Action or None.
+    """
+    import math as _math
+    from .animation_builder import build_action
+    from .vr_mocap import retarget_and_bake
+
+    src_action = build_action(ref_arm, pa, bind_pose=bind_pose,
+                              rebase_unanimated_parents=True)
+    if src_action is None:
+        return None
+
+    if ref_arm.animation_data is None:
+        ref_arm.animation_data_create()
+    prev_action = ref_arm.animation_data.action
+    ref_arm.animation_data.action = src_action
+    try:
+        f0, f1 = src_action.frame_range
+        bone_map = {b.name: b.name for b in ref_arm.data.bones
+                    if b.name in target_arm.data.bones}
+        action, n_mapped, _n_frames = retarget_and_bake(
+            ref_arm, target_arm,
+            int(f0), int(_math.ceil(f1)),
+            action_name=pa.name, root_motion=True, bone_map=bone_map,
+            follow_translation=True)
+    finally:
+        ref_arm.animation_data.action = prev_action
+        try:
+            bpy.data.actions.remove(src_action)
+        except Exception:
+            pass
+
+    if action is not None:
+        action["igb_anim_name"] = pa.name
+        action["igb_duration_ms"] = pa.duration_ms
+        action["igb_track_count"] = len(pa.tracks)
+    return action
+
+
 def _remove_anim_ref_armature(arm):
     """Remove a temp anim-ref armature (object + data + its now-empty collection)."""
     try:
@@ -2286,6 +2371,19 @@ class ACTOR_OT_pick_animation(Operator):
             except Exception:
                 anim_armature = None
 
+        # Foreign-rig detection: a Rig Converter output has Bip01 bone NAMES
+        # but its own rest orientations/rolls — applying game anims through
+        # those rests directly gives a crooked lean. Route through the ref
+        # armature (native math there) + world-delta retarget instead.
+        retarget_mode = (
+            anim_armature is not None
+            and _rest_local_mismatch(armature_obj, anim_armature)
+        )
+        if retarget_mode:
+            self.report({'INFO'},
+                        "Custom rig detected — retargeting animations "
+                        "through the game skeleton")
+
         fps = context.scene.render.fps
         imported_count = 0
         try:
@@ -2333,12 +2431,17 @@ class ACTOR_OT_pick_animation(Operator):
                 # tilt-back). Internally gated to fire only when the anim's
                 # bind quat is absent/degenerate, so XML2/v6 files (valid
                 # binds, already correct) are untouched.
-                action = build_action(armature_obj, pa_to_build,
-                                      bind_pose=bind_pose,
-                                      bone_remap=bone_remap,
-                                      target_bind_pose=target_bind_pose,
-                                      anim_armature=anim_armature,
-                                      rebase_unanimated_parents=True)
+                if retarget_mode:
+                    action = _import_anim_via_retarget(
+                        context, anim_armature, armature_obj, pa_to_build,
+                        bind_pose)
+                else:
+                    action = build_action(armature_obj, pa_to_build,
+                                          bind_pose=bind_pose,
+                                          bone_remap=bone_remap,
+                                          target_bind_pose=target_bind_pose,
+                                          anim_armature=anim_armature,
+                                          rebase_unanimated_parents=True)
                 if action is None:
                     continue
                 if hold_from:

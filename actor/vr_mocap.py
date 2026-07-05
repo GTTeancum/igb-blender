@@ -113,7 +113,8 @@ def _depth(bone):
 
 def retarget_and_bake(src_arm, tgt_arm, frame_start, frame_end,
                       game='xml2', action_name="VR_Take", root_motion=True,
-                      step=1, hip_scale=None):
+                      step=1, hip_scale=None, bone_map=None,
+                      follow_translation=False):
     """Retarget ``src_arm``'s animation onto ``tgt_arm`` and bake a new Action.
 
     Args:
@@ -125,6 +126,15 @@ def retarget_and_bake(src_arm, tgt_arm, frame_start, frame_end,
         root_motion: If True, carry (scaled) hip translation on the Pelvis.
         step: Frame step (1 = every frame).
         hip_scale: Override the auto hip-height scale (float) or None to auto.
+        bone_map: Optional explicit {target_bone: source_bone} map. Default
+            builds the fuzzy CATS map (VR rigs). Pass an identity map when
+            both armatures already share Bip01 names (game-anim → converted
+            rig import).
+        follow_translation: If True, carry each source bone's per-frame
+            translation deviation from its OWN rest FK onto the target
+            (scaled). Game anims animate joint translations subtly (feet
+            drift ~5 units without this); VR mocap should leave it off so
+            target bone lengths stay rigid.
 
     Returns:
         (action, n_mapped, n_frames) on success, or (None, 0, 0) on failure.
@@ -132,7 +142,8 @@ def retarget_and_bake(src_arm, tgt_arm, frame_start, frame_end,
     import bpy
     from mathutils import Matrix, Vector
 
-    bone_map = build_retarget_map(src_arm, tgt_arm, game=game)
+    if bone_map is None:
+        bone_map = build_retarget_map(src_arm, tgt_arm, game=game)
     if len(bone_map) < 3:
         _log.error("Retarget map too small (%d bones) — source/target names "
                    "don't correspond", len(bone_map))
@@ -166,6 +177,19 @@ def retarget_and_bake(src_arm, tgt_arm, frame_start, frame_end,
             rest_offset[b.name] = b.parent.matrix_local.inverted() @ b.matrix_local
         else:
             rest_offset[b.name] = b.matrix_local.copy()
+
+    # Source rest offsets (for follow_translation).
+    src_rest_offset = {}
+    if follow_translation:
+        for tgt_name, src_name in bone_map.items():
+            sb = src_data.get(src_name)
+            if sb is None:
+                continue
+            if sb.parent:
+                src_rest_offset[src_name] = (
+                    sb.parent.matrix_local.inverted() @ sb.matrix_local)
+            else:
+                src_rest_offset[src_name] = sb.matrix_local.copy()
 
     tgt_order = _hierarchy_order(tgt_arm)
 
@@ -211,6 +235,7 @@ def retarget_and_bake(src_arm, tgt_arm, frame_start, frame_end,
 
         # Precompute source world-delta rotations for this frame.
         delta_w3 = {}
+        trans_delta_w = {}  # follow_translation: world head deviation vs rest FK
         for tgt_name, src_name in bone_map.items():
             spb = src_pose.get(src_name)
             rest = src_rest_w3.get(src_name)
@@ -218,6 +243,14 @@ def retarget_and_bake(src_arm, tgt_arm, frame_start, frame_end,
                 continue
             s_pose_w3 = (src_mw3 @ spb.matrix.to_3x3())
             delta_w3[tgt_name] = s_pose_w3 @ rest.inverted()
+
+            if follow_translation and spb.parent is not None:
+                sro = src_rest_offset.get(src_name)
+                if sro is not None:
+                    expected = (spb.parent.matrix @ sro).translation
+                    d_arm = spb.matrix.translation - expected
+                    if d_arm.length_squared > 1e-8:
+                        trans_delta_w[tgt_name] = src_mw3 @ d_arm
 
         # Hip translation (world), scaled to armature space.
         disp_arm = None
@@ -243,6 +276,8 @@ def retarget_and_bake(src_arm, tgt_arm, frame_start, frame_end,
                 head = (parent_pose @ ro).translation
                 if name == pelvis_name and disp_arm is not None:
                     head = head + disp_arm
+                if name in trans_delta_w:
+                    head = head + tgt_mw3_inv @ (trans_delta_w[name] * scale)
                 pose_arm = Matrix.Translation(head) @ desired_arm3.to_4x4()
             else:
                 # Unmapped bone: rigidly follow parent at its rest offset.
@@ -257,7 +292,8 @@ def retarget_and_bake(src_arm, tgt_arm, frame_start, frame_end,
                     pb.matrix_basis = basis
                     pb.keyframe_insert("rotation_quaternion", frame=f,
                                        group=name)
-                    if name == pelvis_name and root_motion:
+                    if ((name == pelvis_name and root_motion)
+                            or name in trans_delta_w):
                         pb.keyframe_insert("location", frame=f, group=name)
 
     scene.frame_set(saved_frame)

@@ -1,6 +1,13 @@
 # Changelog
 
 ## Unreleased
+- **Game animations now import correctly onto converted custom rigs** (Rig
+  Converter outputs). Custom rigs carry their own bone rolls/rest
+  orientations under Bip01 names — applying game anims through those rests
+  directly gave a crooked full-body lean. Import Animations now detects the
+  rest mismatch and retargets through the game skeleton (world-delta +
+  analytic FK, rotation-exact vs the game pose, custom proportions
+  preserved). Game-imported actors are unaffected (native path).
 - **Animation export FIXED** — exported moveset .igb files were corrupt
   (every Enbaya blob's memory layout shifted; ~180° rotation errors on
   re-import). Three root causes fixed: shared memory-directory entries are
