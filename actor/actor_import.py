@@ -92,6 +92,37 @@ def import_actor(context, anim_filepath, skin_filepaths=None,
             operator.report({'ERROR'}, "No skeleton found in animation file")
         return None
 
+    # ---- 2b. Prefer the SKIN's skeleton for the armature ----
+    # Some moveset files ship a REDUCED skeleton that differs from the skin's
+    # (MUA1 PS2: e.g. 04_storm.igb has a 35-bone ''-root skeleton while the
+    # skin 0401.igb has the full 43-bone 'Unnamed bone' skeleton). The mesh
+    # binds to the SKIN skeleton, so the armature must use it — otherwise the
+    # vertex groups reference bones the armature lacks and the model mangles
+    # (Storm bent, while Wolverine with matched skeletons was fine). The
+    # animation is unaffected: its tracks are applied by bone NAME, so the
+    # common bones still animate. `skeleton` (the moveset's) stays the source
+    # for animation parsing; `armature_skeleton` builds the rig.
+    # Only relevant when we actually import a skin MESH — the mesh binds to
+    # the skin skeleton. The reference armature built for retargeting/rebasing
+    # (import_skins=False, no mesh) must keep the ANIM skeleton so those paths
+    # stay correct (otherwise #45 nickfury regresses).
+    armature_skeleton = skeleton
+    bind_reader = reader
+    if skin_filepaths and options.get('import_skins', True):
+        _fs = skin_filepaths[0][1] if skin_filepaths[0] else None
+        if (_fs and os.path.exists(_fs)
+                and os.path.abspath(_fs) != os.path.abspath(anim_filepath)):
+            try:
+                from ..igb_format.igb_reader import IGBReader as _IGBReader
+                _sr = _IGBReader(_fs)
+                _sr.read()
+                _skin_skel = extract_skeleton(_sr)
+                if _skin_skel and len(_skin_skel.bones) > len(skeleton.bones):
+                    armature_skeleton = _skin_skel
+                    bind_reader = _sr
+            except Exception:
+                pass
+
     # Derive actor name from filename
     anim_basename = os.path.splitext(os.path.basename(anim_filepath))[0]
 
@@ -103,7 +134,9 @@ def import_actor(context, anim_filepath, skin_filepaths=None,
     # The bind pose (afakeanim frame 0) defines bone positions and
     # orientations. This is REQUIRED for correct armature building,
     # regardless of whether animations are imported.
-    parsed_anims_early = extract_animations(reader, skeleton)
+    # Bind pose for the ARMATURE skeleton (from the skin file when we adopted
+    # its skeleton above, else the main file).
+    parsed_anims_early = extract_animations(bind_reader, armature_skeleton)
     bind_pose = _extract_bind_pose(parsed_anims_early)
 
     # ---- 3b. Pre-extract inverse joint matrices from skin skeleton ----
@@ -121,12 +154,12 @@ def import_actor(context, anim_filepath, skin_filepaths=None,
             # Also extract skin vertex data as fallback (if no bind_pose)
             if not bind_pose:
                 skin_data_for_armature = _extract_skin_data(
-                    first_skin_path, skeleton, profile
+                    first_skin_path, armature_skeleton, profile
                 )
 
     # ---- 4. Build armature (using inv_joint + bind-pose hybrid, or fallback) ----
     armature_obj = build_armature(
-        context, skeleton, anim_basename, actor_coll,
+        context, armature_skeleton, anim_basename, actor_coll,
         skin_data=skin_data_for_armature,
         bind_pose=bind_pose,
         inv_joint_data=inv_joint_data,

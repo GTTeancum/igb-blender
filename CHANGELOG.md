@@ -1,6 +1,15 @@
 # Changelog
 
 ## Unreleased
+- **Fixed mangled imports when a character's skin and moveset files carry
+  different skeletons** (MUA1 PS2: e.g. Storm's skin `0401.igb` has the full
+  43-bone `Unnamed bone` skeleton, but her moveset `04_storm.igb` ships a
+  reduced 35-bone skeleton). The importer built the armature from the moveset
+  and the skin-bound mesh deformed onto the wrong bones (Storm bent while
+  Wolverine, whose skin/moveset skeletons match, was fine). The armature is
+  now built from the **skin** skeleton (which the mesh binds to) when it is
+  fuller than the moveset's; animations still apply by bone name. Reference
+  armatures used for retargeting keep the moveset skeleton (no regression).
 - **Root-cause fix for crooked animations on custom / cross-game rigs.**
   A rig whose Bip01 root is rotated off the game skeleton (a Rig Converter
   output, or an XML1-PS2 skin driven by XML2/MUA anims) played every game
