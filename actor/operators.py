@@ -133,7 +133,7 @@ def _import_anim_via_retarget(context, ref_arm, target_arm, pa, bind_pose):
             ref_arm, target_arm,
             int(f0), int(_math.ceil(f1)),
             action_name=pa.name, root_motion=True, bone_map=bone_map,
-            follow_translation=True)
+            follow_translation=True, match_absolute=True)
     finally:
         ref_arm.animation_data.action = prev_action
         try:

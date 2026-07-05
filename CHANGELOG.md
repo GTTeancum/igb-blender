@@ -12,6 +12,12 @@
   difference — a single root bone like the Pelvis being ~90° off (XML1-PS2
   vs XML2-PC) tilts the whole body even though only 1-2 bones differ. It
   previously required a broad (>25% of bones) difference and missed this.
+- Retarget now **absolute pose-matches** for game-anim import (the target
+  reaches the game bone's world orientation) instead of delta-retargeting
+  (rig rest + motion). Delta retargeting preserved a rig's wrong root rest
+  as the baseline, so a rig whose Bip01 is turned ~90° (e.g. Cyclops97
+  imports) kept its arms splayed out. Absolute-match reproduces the game
+  pose exactly (0.0-unit joint match). VR mocap still uses delta.
 - **Animation export FIXED** — exported moveset .igb files were corrupt
   (every Enbaya blob's memory layout shifted; ~180° rotation errors on
   re-import). Three root causes fixed: shared memory-directory entries are

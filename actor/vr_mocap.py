@@ -114,7 +114,7 @@ def _depth(bone):
 def retarget_and_bake(src_arm, tgt_arm, frame_start, frame_end,
                       game='xml2', action_name="VR_Take", root_motion=True,
                       step=1, hip_scale=None, bone_map=None,
-                      follow_translation=False):
+                      follow_translation=False, match_absolute=False):
     """Retarget ``src_arm``'s animation onto ``tgt_arm`` and bake a new Action.
 
     Args:
@@ -135,6 +135,12 @@ def retarget_and_bake(src_arm, tgt_arm, frame_start, frame_end,
             (scaled). Game anims animate joint translations subtly (feet
             drift ~5 units without this); VR mocap should leave it off so
             target bone lengths stay rigid.
+        match_absolute: If True, each target bone reaches the SOURCE bone's
+            absolute world orientation (pose-match — for game-anim import,
+            where the anim defines a full absolute pose and the target must
+            look identical to the game skeleton regardless of its own rest).
+            If False (default), delta retarget: preserve the target's rest
+            as baseline and add the source's motion (VR mocap).
 
     Returns:
         (action, n_mapped, n_frames) on success, or (None, 0, 0) on failure.
@@ -233,8 +239,9 @@ def retarget_and_bake(src_arm, tgt_arm, frame_start, frame_end,
     for f in frames:
         scene.frame_set(f)
 
-        # Precompute source world-delta rotations for this frame.
+        # Precompute source world rotations for this frame.
         delta_w3 = {}
+        abs_w3 = {}         # source ABSOLUTE world orientation (match_absolute)
         trans_delta_w = {}  # follow_translation: world head deviation vs rest FK
         for tgt_name, src_name in bone_map.items():
             spb = src_pose.get(src_name)
@@ -243,6 +250,7 @@ def retarget_and_bake(src_arm, tgt_arm, frame_start, frame_end,
                 continue
             s_pose_w3 = (src_mw3 @ spb.matrix.to_3x3())
             delta_w3[tgt_name] = s_pose_w3 @ rest.inverted()
+            abs_w3[tgt_name] = s_pose_w3
 
             if follow_translation and spb.parent is not None:
                 sro = src_rest_offset.get(src_name)
@@ -271,7 +279,16 @@ def retarget_and_bake(src_arm, tgt_arm, frame_start, frame_end,
 
             if name in delta_w3:
                 # Desired armature-space rotation for this bone.
-                desired_w3 = delta_w3[name] @ tgt_rest_w3[name]
+                # match_absolute: make the target bone reach the SOURCE bone's
+                # absolute world orientation (game anims are absolute poses, so
+                # the rig must match the game pose regardless of its own rest).
+                # Otherwise: delta retarget — keep the target's rest as the
+                # baseline and add the source's motion (VR mocap / proportion-
+                # preserving transfer).
+                if match_absolute:
+                    desired_w3 = abs_w3[name]
+                else:
+                    desired_w3 = delta_w3[name] @ tgt_rest_w3[name]
                 desired_arm3 = tgt_mw3_inv @ desired_w3
                 head = (parent_pose @ ro).translation
                 if name == pelvis_name and disp_arm is not None:
