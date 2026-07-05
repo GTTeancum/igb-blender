@@ -1,6 +1,26 @@
 # Changelog
 
 ## Unreleased
+- **Animation export FIXED** — exported moveset .igb files were corrupt
+  (every Enbaya blob's memory layout shifted; ~180° rotation errors on
+  re-import). Three root causes fixed: shared memory-directory entries are
+  now cloned instead of mutated when a blob resizes; the translation
+  reverse used the inverted rest matrix; the rotation reverse was missing
+  the bind-pose branch (XML2). Round-trip now verified at 0.01–0.02° average
+  error on XML2 and MUA — quantization-exact.
+- **Replace Animation in File…** (IGB Actors → Animations): swap ANY
+  animation inside a moveset .igb (e.g. 01_cyclops.igb) for any Blender
+  action — cross-slot (put a menu_action on the idle slot), and/or rename
+  the slot (the game binds animations by name, so renaming an unused slot
+  effectively adds a new animation). Untouched animations stay
+  byte-identical.
+- **Ground Preview** button (anchor icon next to Play): mutes root-bone
+  location curves so MUA actors no longer float/slide in the viewport.
+  Preview-only — export still reads the full curves, and the game applies
+  root motion itself.
+- ig*List count AND capacity fields both patched on keyframe-list resize;
+  8 Hz low-rate blobs keep their real sample rate + signature on export.
+- Regression suite: new animation-export round-trip check (18 checks).
 - "Auto-Detect Game Folder" replaced with **Set Game Folder…** — a validated
   folder picker (these games are 2005/2006-era and long delisted; scanning
   Steam/GOG paths never finds them). Picking a subfolder like maps/ walks up

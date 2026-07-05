@@ -413,6 +413,56 @@ class ACTOR_OT_play_animation(Operator):
         return {'FINISHED'}
 
 
+class ACTOR_OT_ground_preview(Operator):
+    """Ground the animation preview: mute the root bones' location curves so
+    the character doesn't float/slide in the viewport. Preview-only — the
+    game applies root motion itself, and export still reads the full curves
+    (muted F-Curves evaluate normally for export sampling)"""
+    bl_idname = "actor.ground_preview"
+    bl_label = "Ground Preview"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    # Root-level bones whose location the engine owns at runtime
+    _ROOT_BONES = ("Bip01", "Motion")
+
+    @classmethod
+    def poll(cls, context):
+        props = context.scene.igb_actor
+        arm = bpy.data.objects.get(props.active_armature)
+        return (arm is not None and arm.animation_data
+                and arm.animation_data.action)
+
+    def execute(self, context):
+        props = context.scene.igb_actor
+        arm = bpy.data.objects.get(props.active_armature)
+        action = arm.animation_data.action
+
+        targets = []
+        for fc in action.fcurves:
+            if not fc.data_path.endswith(".location"):
+                continue
+            for rb in self._ROOT_BONES:
+                if fc.data_path == f'pose.bones["{rb}"].location':
+                    targets.append(fc)
+                    break
+
+        if not targets:
+            self.report({'INFO'}, "No root location curves in this action")
+            return {'CANCELLED'}
+
+        # Toggle: if any are unmuted, mute all; else unmute all
+        mute = any(not fc.mute for fc in targets)
+        for fc in targets:
+            fc.mute = mute
+        # Force re-evaluation of the pose
+        arm.update_tag()
+        context.scene.frame_set(context.scene.frame_current)
+
+        state = "grounded (root motion hidden)" if mute else "full root motion"
+        self.report({'INFO'}, f"Preview: {state}")
+        return {'FINISHED'}
+
+
 class ACTOR_OT_import_animations(Operator, ImportHelper):
     """Import animations from an IGB file (select which ones)"""
     bl_idname = "actor.import_animations"
@@ -1242,6 +1292,155 @@ class ACTOR_OT_export_animations(Operator, ExportHelper):
                 self.filepath = os.path.join(dirname, f"{stem}_export.igb")
         context.window_manager.fileselect_add(self)
         return {'RUNNING_MODAL'}
+
+
+# Enum item caches — Blender requires the strings returned by enum-items
+# callbacks to stay referenced, or the UI shows garbage / crashes.
+_replace_target_items = []
+_replace_action_items = []
+
+
+def _replace_anim_target_items(self, context):
+    return _replace_target_items or [("NONE", "(no template loaded)", "")]
+
+
+def _replace_anim_action_items(self, context):
+    return _replace_action_items or [("NONE", "(no actions in file)", "")]
+
+
+class ACTOR_OT_replace_animation(Operator, ExportHelper):
+    """Replace or rename ONE animation inside a moveset .igb (e.g. swap the
+    idle in 01_cyclops.igb for any Blender action, or repurpose an unused
+    slot under a new name)"""
+    bl_idname = "actor.replace_animation"
+    bl_label = "Replace Animation…"
+    bl_options = {'REGISTER'}
+
+    filename_ext = ".igb"
+    filter_glob: StringProperty(default="*.igb", options={'HIDDEN'})
+
+    target_anim: EnumProperty(
+        name="Target",
+        description="Animation inside the .igb to replace",
+        items=_replace_anim_target_items,
+    )
+    source_action: EnumProperty(
+        name="Action",
+        description="Blender action whose motion replaces the target",
+        items=_replace_anim_action_items,
+    )
+    rename_only: BoolProperty(
+        name="Rename Only",
+        description="Keep the target's original motion, just change its name "
+                    "(the game binds animations by name)",
+        default=False,
+    )
+    new_name: StringProperty(
+        name="New Name",
+        description="Optional: rename the target animation in the output "
+                    "(e.g. turn an unused slot into a new animation name)",
+        default="",
+    )
+
+    @classmethod
+    def poll(cls, context):
+        props = context.scene.igb_actor
+        arm = bpy.data.objects.get(props.active_armature)
+        return arm is not None and arm.get("igb_anim_file", "")
+
+    def draw(self, context):
+        layout = self.layout
+        layout.prop(self, "target_anim")
+        layout.prop(self, "rename_only")
+        row = layout.row()
+        row.enabled = not self.rename_only
+        row.prop(self, "source_action")
+        layout.prop(self, "new_name")
+
+    def invoke(self, context, event):
+        from .animation_export import list_template_animations
+        props = context.scene.igb_actor
+        armature_obj = bpy.data.objects.get(props.active_armature)
+        template = armature_obj.get("igb_anim_file", "") if armature_obj else ""
+        if not template or not os.path.exists(template):
+            self.report({'ERROR'}, "Armature has no animation .igb on record "
+                                   "(re-import the actor with animations)")
+            return {'CANCELLED'}
+
+        _replace_target_items.clear()
+        try:
+            for name, dur in list_template_animations(template):
+                _replace_target_items.append(
+                    (name, name, f"{dur:.2f}s"))
+        except Exception as exc:
+            self.report({'ERROR'}, f"Could not read template: {exc}")
+            return {'CANCELLED'}
+        if not _replace_target_items:
+            self.report({'ERROR'}, "No animations found in the template .igb")
+            return {'CANCELLED'}
+
+        _replace_action_items.clear()
+        for act in bpy.data.actions:
+            _replace_action_items.append((act.name, act.name, ""))
+        if not _replace_action_items:
+            self.report({'ERROR'}, "No actions in this .blend to export")
+            return {'CANCELLED'}
+
+        # Preselect: active object's current action, and its matching slot
+        obj = context.active_object
+        cur = (obj.animation_data.action.name
+               if obj and obj.animation_data and obj.animation_data.action
+               else "")
+        if cur:
+            self.source_action = cur
+            act = bpy.data.actions.get(cur)
+            slot = act.get("igb_anim_name", "") if act else ""
+            if slot and any(slot == it[0] for it in _replace_target_items):
+                self.target_anim = slot
+
+        dirname = os.path.dirname(template)
+        stem = os.path.splitext(os.path.basename(template))[0]
+        self.filepath = os.path.join(dirname, f"{stem}_replaced.igb")
+        context.window_manager.fileselect_add(self)
+        return {'RUNNING_MODAL'}
+
+    def execute(self, context):
+        from .animation_export import export_animations
+
+        if self.target_anim in ("", "NONE"):
+            self.report({'ERROR'}, "No target animation selected")
+            return {'CANCELLED'}
+
+        actions = []
+        name_overrides = None
+        if not self.rename_only:
+            action = bpy.data.actions.get(self.source_action)
+            if action is None:
+                self.report({'ERROR'}, "Source action not found")
+                return {'CANCELLED'}
+            if action.get("igb_identity_hold"):
+                self.report({'ERROR'},
+                            f"'{action.name}' is an engine hold clip with no "
+                            f"motion of its own — pick another action")
+                return {'CANCELLED'}
+            actions = [action]
+            name_overrides = {action.name: self.target_anim}
+
+        rename_map = None
+        new_name = self.new_name.strip()
+        if new_name and new_name != self.target_anim:
+            rename_map = {self.target_anim: new_name}
+
+        if not actions and not rename_map:
+            self.report({'ERROR'}, "Nothing to do: rename-only with no new name")
+            return {'CANCELLED'}
+
+        return export_animations(
+            context, self.filepath, operator=self,
+            actions_override=actions,
+            name_overrides=name_overrides,
+            rename_map=rename_map,
+        )
 
 
 def _obj_alive(obj):
@@ -4554,6 +4753,8 @@ _classes = (
     ACTOR_OT_export_skin,
     ACTOR_OT_export_mannequin,
     ACTOR_OT_export_animations,
+    ACTOR_OT_replace_animation,
+    ACTOR_OT_ground_preview,
     ACTOR_OT_setup_skin,
     ACTOR_OT_add_mesh_as_skin,
     ACTOR_OT_remove_skin,

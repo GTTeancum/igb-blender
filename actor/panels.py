@@ -552,6 +552,7 @@ class ACTOR_PT_Animations(Panel):
         play_icon = 'PAUSE' if is_playing else 'PLAY'
         play_text = "Stop" if is_playing else "Play"
         row.operator("actor.play_animation", text=play_text, icon=play_icon)
+        row.operator("actor.ground_preview", text="", icon='ANCHOR_BOTTOM')
 
         if props.animations_index < len(props.animations):
             anim = props.animations[props.animations_index]
@@ -567,6 +568,9 @@ class ACTOR_PT_Animations(Panel):
                      icon='IMPORT')
         row.operator("actor.export_animations", text="Export Animations",
                      icon='EXPORT')
+        layout.operator("actor.replace_animation",
+                        text="Replace Animation in File…",
+                        icon='FILE_REFRESH')
 
 
 def _actor_material_meshes(context):

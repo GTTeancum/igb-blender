@@ -66,7 +66,9 @@ def _update_object_long_field(writer, obj_index, slot, new_value):
             return
 
 
-def export_animations(context, filepath, operator=None):
+def export_animations(context, filepath, operator=None,
+                      actions_override=None, name_overrides=None,
+                      rename_map=None, template_override=None):
     """Export animations from the active armature to an IGB file.
 
     Uses the actor's original animation IGB as template.
@@ -75,6 +77,17 @@ def export_animations(context, filepath, operator=None):
         context: Blender context
         filepath: output .igb file path
         operator: the export operator (for error reporting)
+        actions_override: optional list of Actions to export (default: the
+            panel's animation list). Lets the Animation Replacer patch a
+            single chosen action.
+        name_overrides: optional {action_name: template_anim_name} — export
+            an action ONTO a differently-named template animation (replace
+            any slot with any action).
+        rename_map: optional {template_anim_name: new_name} — rename
+            animations in the OUTPUT file (repurpose an unused slot as a
+            "new" animation; the game binds animations by name).
+        template_override: optional template .igb path (default: the
+            armature's igb_anim_file).
 
     Returns:
         {'FINISHED'} or {'CANCELLED'}
@@ -89,7 +102,7 @@ def export_animations(context, filepath, operator=None):
         return {'CANCELLED'}
 
     # Get template file path
-    template_path = armature_obj.get("igb_anim_file", "")
+    template_path = template_override or armature_obj.get("igb_anim_file", "")
     if not template_path or not os.path.exists(template_path):
         if operator:
             operator.report({'ERROR'},
@@ -116,13 +129,16 @@ def export_animations(context, filepath, operator=None):
     endian = reader.header.endian
 
     # Collect all Actions to export
-    actions_to_export = []
-    for item in props.animations:
-        action = bpy.data.actions.get(item.action_name)
-        if action is not None:
-            actions_to_export.append(action)
+    if actions_override is not None:
+        actions_to_export = list(actions_override)
+    else:
+        actions_to_export = []
+        for item in props.animations:
+            action = bpy.data.actions.get(item.action_name)
+            if action is not None:
+                actions_to_export.append(action)
 
-    if not actions_to_export:
+    if not actions_to_export and not rename_map:
         if operator:
             operator.report({'WARNING'}, "No animations to export")
         return {'CANCELLED'}
@@ -140,10 +156,12 @@ def export_animations(context, filepath, operator=None):
     bind_pose = _extract_bind_pose(parsed_anims) if parsed_anims else None
 
     bind_trans_map = {}
+    bind_quat_map = {}
     if bind_pose:
         from mathutils import Vector
         for bone_name, (quat_wxyz, trans_xyz) in bind_pose.items():
             bind_trans_map[bone_name] = Vector(trans_xyz)
+            bind_quat_map[bone_name] = quat_wxyz
 
     # Build a map: animation_name -> igAnimation object index in reader
     anim_obj_map = _build_anim_object_map(reader)
@@ -181,6 +199,14 @@ def export_animations(context, filepath, operator=None):
 
     for action in actions_to_export:
         anim_name = action.get("igb_anim_name", action.name)
+        if name_overrides and action.name in name_overrides:
+            anim_name = name_overrides[action.name]
+
+        # Identity-hold actions (e.g. lunge_loop) carry NO pose of their
+        # own — exporting them would overwrite the original identity blob
+        # with a rest pose. Leave the template's original data untouched.
+        if action.get("igb_identity_hold"):
+            continue
 
         # Find matching template animation
         anim_info = anim_obj_map.get(anim_name)
@@ -194,7 +220,8 @@ def export_animations(context, filepath, operator=None):
         if anim_info['tracks']:
             success = _patch_animation(
                 reader, writer, anim_info, action, armature_obj,
-                rest_data, bind_trans_map, endian, fps
+                rest_data, bind_trans_map, endian, fps,
+                bind_quat_map=bind_quat_map
             )
 
         # Collect enbaya tracks for deferred blob processing
@@ -230,7 +257,8 @@ def export_animations(context, filepath, operator=None):
         ok = _patch_enbaya_blob(
             reader, writer, blob_ref, track_map,
             blob_duration_ns[blob_ref],
-            armature_obj, rest_data, bind_trans_map, endian, fps
+            armature_obj, rest_data, bind_trans_map, endian, fps,
+            bind_quat_map=bind_quat_map
         )
         if ok:
             enbaya_blobs_ok += 1
@@ -238,7 +266,13 @@ def export_animations(context, filepath, operator=None):
     if enbaya_blobs_ok > 0:
         _log.info("Patched %d enbaya blob(s)", enbaya_blobs_ok)
 
-    if patched_count == 0:
+    # Apply renames (repurpose a slot as a "new" animation — the game binds
+    # animations by name, so renaming IS adding as far as the engine cares)
+    renamed_count = 0
+    if rename_map:
+        renamed_count = _apply_renames(reader, writer, anim_obj_map, rename_map)
+
+    if patched_count == 0 and renamed_count == 0:
         if operator:
             msg = "No animations could be exported."
             if skipped_no_match:
@@ -289,6 +323,59 @@ def _compute_rest_local_data(armature_obj):
         result[bone.name] = (rest_rot, rest_q)
 
     return result
+
+
+def list_template_animations(template_path):
+    """List animations in an anim IGB: [(name, duration_sec), ...].
+
+    Cheap parse for UI dropdowns (Animation Replacer target list).
+    """
+    from ..igb_format.igb_reader import IGBReader
+
+    reader = IGBReader(template_path)
+    reader.read()
+    anim_map = _build_anim_object_map(reader)
+    out = []
+    for name, info in anim_map.items():
+        out.append((name, info.get('duration_ns', 0) / 1_000_000_000.0))
+    out.sort(key=lambda t: t[0])
+    return out
+
+
+def _apply_renames(reader, writer, anim_obj_map, rename_map):
+    """Rename animations in the output file.
+
+    Patches the igAnimation's String name field. The engine looks
+    animations up by name (from powerstyles/fightstyles/menu code), so
+    renaming a slot effectively ADDS an animation under the new name.
+
+    Args:
+        rename_map: {current_anim_name: new_name}
+
+    Returns:
+        number of animations renamed
+    """
+    from ..igb_format.igb_writer import ObjectDef
+
+    count = 0
+    for old_name, new_name in rename_map.items():
+        if not new_name or new_name == old_name:
+            continue
+        info = anim_obj_map.get(old_name)
+        if info is None:
+            _log.warning("Rename: no animation named %r in template", old_name)
+            continue
+        wobj = writer.objects[info['anim_obj_index']]
+        if not isinstance(wobj, ObjectDef):
+            continue
+        for i, (slot, val, fd) in enumerate(wobj.raw_fields):
+            if fd.short_name == b"String":
+                wobj.raw_fields[i] = (slot, new_name, fd)
+                wobj.raw_bytes = None  # force re-serialization
+                count += 1
+                _log.info("Renamed animation %r -> %r", old_name, new_name)
+                break
+    return count
 
 
 def _build_anim_object_map(reader):
@@ -390,7 +477,8 @@ def _build_anim_object_map(reader):
 
 
 def _patch_animation(reader, writer, anim_info, action, armature_obj,
-                     rest_data, bind_trans_map, endian, fps):
+                     rest_data, bind_trans_map, endian, fps,
+                     bind_quat_map=None):
     """Patch a single animation in the writer with data from a Blender Action.
 
     Returns True on success.
@@ -438,6 +526,7 @@ def _patch_animation(reader, writer, anim_info, action, armature_obj,
         rest_rot = rest_info[0] if rest_info else None
         rest_q = rest_info[1] if rest_info else None
         bind_trans = bind_trans_map.get(bone_name)
+        bind_q = bind_quat_map.get(bone_name) if bind_quat_map else None
 
         # Sample keyframes from F-curves
         keyframes = _sample_fcurve_keyframes(
@@ -449,7 +538,7 @@ def _patch_animation(reader, writer, anim_info, action, armature_obj,
 
         # Convert keyframes to Alchemy format
         alchemy_keyframes = _convert_keyframes_to_alchemy(
-            keyframes, rest_q, rest_rot, bind_trans
+            keyframes, rest_q, rest_rot, bind_trans, bind_q=bind_q
         )
 
         # Pack and patch the memory blocks + update duration/offset
@@ -523,47 +612,74 @@ def _sample_fcurve_keyframes(action, bone_name, quat_fcurves, loc_fcurves, fps):
     return keyframes
 
 
-def _convert_keyframes_to_alchemy(keyframes, rest_q, rest_rot, bind_trans):
-    """Convert Blender pose keyframes to Alchemy format.
+def _reverse_pose_to_alchemy(pose_q, pose_loc, rest_q, bind_trans, bind_q):
+    """Reverse ONE Blender pose sample to Alchemy (quat_xyzw, trans_xyz).
 
-    Reverses:
-        pose_q = rest_q^{-1} @ conjugate(anim_q)
-        → anim_q = conjugate(rest_q @ pose_q)
+    This is the EXACT mirror of animation_builder's forward apply:
 
-        pose_loc = rest_rot_inv @ (anim_trans - bind_trans)
-        → anim_trans = bind_trans + rest_rot @ pose_loc
+    Rotation, bind-delta branch (valid bind quat, magnitude >= 0.5 — the
+    same guard the forward keyframe writer uses):
+        forward:  pose_q = rest_q⁻¹ @ conj(anim_q) @ bind_q @ rest_q
+        reverse:  anim_q = conj( rest_q @ pose_q @ rest_q⁻¹ @ bind_q⁻¹ )
+    Rotation, absolute branch (bind absent/degenerate — v8 MUA files):
+        forward:  pose_q = rest_q⁻¹ @ conj(anim_q)
+        reverse:  anim_q = conj( rest_q @ pose_q )
 
-    Returns list of (time_ns, quat_xyzw, trans_xyz) in Alchemy convention.
+    Translation (mirror of _insert_location_keyframes):
+        forward:  pose_loc = rest_rot_inv @ (anim_trans − bind_trans)
+        reverse:  anim_trans = bind_trans + rest_rot @ pose_loc
+    where rest_rot is the TRUE rest rotation (rest_q as a matrix) — the old
+    code used the INVERTED matrix here, which broke every exported
+    translation.
     """
     from mathutils import Quaternion, Vector
 
+    pq = Quaternion(pose_q) if not isinstance(pose_q, Quaternion) else pose_q
+
+    bq = None
+    if bind_q is not None:
+        bq = Quaternion(bind_q)
+        if bq.magnitude < 0.5:   # degenerate v8 bind — absolute branch
+            bq = None
+
+    if rest_q is not None and bq is not None:
+        aq = (rest_q @ pq @ rest_q.inverted() @ bq.inverted()).conjugated()
+    elif rest_q is not None:
+        aq = (rest_q @ pq).conjugated()
+    else:
+        aq = pq.conjugated()
+    aq.normalize()
+    quat_xyzw = (aq.x, aq.y, aq.z, aq.w)
+
+    pl = Vector(pose_loc) if not isinstance(pose_loc, Vector) else pose_loc
+    if rest_q is not None and bind_trans is not None:
+        anim_trans = bind_trans + rest_q.to_matrix() @ pl
+        trans = (anim_trans.x, anim_trans.y, anim_trans.z)
+    elif bind_trans is not None:
+        anim_trans = bind_trans + pl
+        trans = (anim_trans.x, anim_trans.y, anim_trans.z)
+    elif rest_q is not None:
+        anim_trans = rest_q.to_matrix() @ pl
+        trans = (anim_trans.x, anim_trans.y, anim_trans.z)
+    else:
+        trans = tuple(pl)
+    return quat_xyzw, trans
+
+
+def _convert_keyframes_to_alchemy(keyframes, rest_q, rest_rot, bind_trans,
+                                  bind_q=None):
+    """Convert Blender pose keyframes to Alchemy format.
+
+    Returns list of (time_ns, quat_xyzw, trans_xyz) in Alchemy convention.
+    (rest_rot is kept in the signature for compatibility but unused — the
+    rotation matrix is derived from rest_q, see _reverse_pose_to_alchemy.)
+    """
     result = []
     for time_ms, pose_q_wxyz, pose_loc in keyframes:
         time_ns = int(time_ms * 1_000_000)
-
-        # Reverse rotation
-        pq = Quaternion(pose_q_wxyz)
-        if rest_q is not None:
-            alchemy_q = (rest_q @ pq).conjugated()
-        else:
-            alchemy_q = pq.conjugated()
-
-        # Convert Blender WXYZ -> Alchemy XYZW
-        quat_xyzw = (alchemy_q.x, alchemy_q.y, alchemy_q.z, alchemy_q.w)
-
-        # Reverse translation
-        pl = Vector(pose_loc)
-        if rest_rot is not None and bind_trans is not None:
-            anim_trans = bind_trans + rest_rot @ pl
-            trans = (anim_trans.x, anim_trans.y, anim_trans.z)
-        elif bind_trans is not None:
-            anim_trans = bind_trans + pl
-            trans = (anim_trans.x, anim_trans.y, anim_trans.z)
-        else:
-            trans = pose_loc
-
+        quat_xyzw, trans = _reverse_pose_to_alchemy(
+            pose_q_wxyz, pose_loc, rest_q, bind_trans, bind_q)
         result.append((time_ns, quat_xyzw, trans))
-
     return result
 
 
@@ -646,29 +762,34 @@ def _patch_data_list(reader, writer, list_obj, num_keys, keyframes,
     if mem_ref_val is None:
         return
 
-    # Update count in the writer's ObjectDef
+    # Update count AND capacity in the writer's ObjectDef — ig*Lists carry
+    # both (slots 2/3); a stale capacity smaller than count crashes in-game.
     writer_obj = writer.objects[list_obj.index]
     if isinstance(writer_obj, ObjectDef):
+        int_seen = 0
         for i, (slot, val, fd) in enumerate(writer_obj.raw_fields):
             if fd.short_name == b"Int":
                 writer_obj.raw_fields[i] = (slot, num_keys, fd)
-                break
+                int_seen += 1
+                if int_seen >= 2:
+                    break
         # Clear raw_bytes so writer re-serializes from patched fields
         writer_obj.raw_bytes = None
 
     # Pack new data
     new_data = b"".join(pack_func(kf) for kf in keyframes)
 
-    # Replace memory block and update its directory entry size
+    # Replace memory block via the entry-cloning helper (shared dir entries —
+    # see _patch_enbaya_blob for the corruption this prevents).
     mem_idx = mem_ref_val
-    # Resolve through ref_info to get the actual memory block index
     if mem_idx < len(reader.ref_info) and not reader.ref_info[mem_idx]['is_object']:
-        writer.objects[mem_idx] = MemoryBlockDef(new_data)
-        _update_entry_mem_size(reader, writer, mem_idx, len(new_data))
+        from .anim_scale import _replace_memblock
+        _replace_memblock(writer, reader, mem_idx, new_data)
 
 
 def _patch_enbaya_blob(reader, writer, blob_ref, track_map, duration_ns,
-                       armature_obj, rest_data, bind_trans_map, endian, fps):
+                       armature_obj, rest_data, bind_trans_map, endian, fps,
+                       bind_quat_map=None):
     """Compress all tracks for one enbaya blob and replace it in the writer.
 
     A single blob can be shared across multiple animations.  This function
@@ -723,9 +844,11 @@ def _patch_enbaya_blob(reader, writer, blob_ref, track_map, duration_ns,
     # Validate the enbaya header — encrypted/scrambled blobs get defaults.
     # Use stricter thresholds to catch garbage values that are technically
     # in range but obviously wrong (e.g., duration=2.5e-43).
+    # sample_rate gate is >= 1, matching the import-side fix: 8 Hz clips
+    # (XML1 powers) are legit and must keep their real rate + signature.
     header_valid = (
         orig_header.track_count >= 1 and orig_header.track_count <= 500 and
-        orig_header.sample_rate >= 10 and orig_header.sample_rate <= 240 and
+        orig_header.sample_rate >= 1 and orig_header.sample_rate <= 240 and
         orig_header.duration >= 0.01 and orig_header.duration <= 300 and
         orig_header.quantization_error >= 1e-6 and
         orig_header.quantization_error <= 0.5
@@ -817,6 +940,7 @@ def _patch_enbaya_blob(reader, writer, blob_ref, track_map, duration_ns,
         rest_rot = rest_info[0] if rest_info else None
         rest_q = rest_info[1] if rest_info else None
         bind_trans = bind_trans_map.get(bone_name)
+        bind_q = bind_quat_map.get(bone_name) if bind_quat_map else None
 
         for si in range(num_samples):
             time_sec = min(si / float(sample_rate), duration_sec)
@@ -841,23 +965,10 @@ def _patch_enbaya_blob(reader, writer, blob_ref, track_map, duration_ns,
             else:
                 pose_loc = Vector((0.0, 0.0, 0.0))
 
-            # Reverse rotation: anim_q = conjugate(rest_q @ pose_q)
-            if rest_q is not None:
-                alchemy_q = (rest_q @ pose_q).conjugated()
-            else:
-                alchemy_q = pose_q.conjugated()
-
-            quat_xyzw = (alchemy_q.x, alchemy_q.y, alchemy_q.z, alchemy_q.w)
-
-            # Reverse translation: anim_trans = bind_trans + rest_rot @ pose_loc
-            if rest_rot is not None and bind_trans is not None:
-                anim_trans = bind_trans + rest_rot @ pose_loc
-                trans = (anim_trans.x, anim_trans.y, anim_trans.z)
-            elif bind_trans is not None:
-                anim_trans = bind_trans + pose_loc
-                trans = (anim_trans.x, anim_trans.y, anim_trans.z)
-            else:
-                trans = tuple(pose_loc)
+            # Reverse the pose to Alchemy — bind-branch aware, exact mirror
+            # of the import formula (see _reverse_pose_to_alchemy).
+            quat_xyzw, trans = _reverse_pose_to_alchemy(
+                pose_q, pose_loc, rest_q, bind_trans, bind_q)
 
             encoder_input[track_id].append((time_sec, quat_xyzw, trans))
 
@@ -873,11 +984,16 @@ def _patch_enbaya_blob(reader, writer, blob_ref, track_map, duration_ns,
         _log.error("Enbaya compression failed for blob %d: %s", blob_ref, exc)
         return False
 
-    # Replace the memory block in the writer and update directory entry size
+    # Replace the memory block. CRITICAL: memory dir entries are SHARED
+    # between blocks of the same size/pool — mutating the entry in place
+    # (the old _update_entry_mem_size) resized every block sharing it and
+    # shifted the whole memory layout, corrupting EVERY blob in the file
+    # (the "export fully broken" bug). anim_scale's _replace_memblock
+    # clones the entry for this ref instead.
     mem_idx = blob_ref
     if mem_idx < len(reader.ref_info) and not reader.ref_info[mem_idx]['is_object']:
-        writer.objects[mem_idx] = MemoryBlockDef(new_blob)
-        _update_entry_mem_size(reader, writer, mem_idx, len(new_blob))
+        from .anim_scale import _replace_memblock
+        _replace_memblock(writer, reader, mem_idx, new_blob)
         _log.info("Enbaya blob %d replaced: %d tracks, %d→%d bytes",
                   blob_ref, num_tracks, len(orig_data), len(new_blob))
         return True
