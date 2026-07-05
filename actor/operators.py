@@ -2518,28 +2518,36 @@ class ACTOR_OT_pick_animation(Operator):
         mismatch = (anim_armature is not None
                     and _rest_local_mismatch(armature_obj, anim_armature))
 
-        # Preferred fix: snap the rig's UNWEIGHTED root bones to the game
-        # skeleton so it becomes a proper game skeleton and anims play
-        # natively (no retarget, both games, no per-game quirks). Only the
-        # structural root (Bone_000/Bip01) is usually off and it carries no
-        # weights, so the mesh doesn't move. Falls back to retargeting when a
-        # skinned bone is off (can't snap without deforming the mesh).
+        # Rig-root handling. Two paths, decided by whether the rig's ONLY
+        # mismatched bones are the UNWEIGHTED structural root (Bone_000/Bip01):
+        #
+        #  * fix_rig_root CLEAN (custom / cross-game rig, e.g. Cyclops97):
+        #    snap those root bones to the game skeleton (mesh doesn't move) so
+        #    the rig becomes a proper game skeleton, then apply the ABSOLUTE
+        #    formula. The bind-branch would T-pose animations that park a bone
+        #    at its bind (cyclops menu_idle), so a corrected rig uses absolute.
+        #
+        #  * NOT clean (a NORMAL game rig — a *skinned* bone legitimately
+        #    differs between the skin's modelling rest and the anim's bind):
+        #    do NOT retarget and do NOT snap; the bind-branch is exactly the
+        #    formula that maps the anim onto the skin's rest (Wolverine idle is
+        #    a correct crouch at extent ~68 this way; absolute collapses it).
         retarget_mode = False
+        use_absolute = False
         if mismatch:
             try:
                 n_fixed, clean = fix_rig_root(context, armature_obj,
                                               anim_armature)
             except Exception as exc:
-                # Never let a root-fix failure crash the import — retarget.
                 n_fixed, clean = 0, False
                 self.report({'WARNING'},
-                            f"Root correction skipped ({exc}); retargeting")
+                            f"Root correction skipped ({exc})")
             if clean and n_fixed > 0:
+                use_absolute = True
                 self.report({'INFO'},
                             f"Corrected rig root ({n_fixed} bone(s)) to match "
                             f"the game skeleton — animations now play natively")
-            elif not clean:
-                retarget_mode = True
+            # not clean -> normal rig -> native bind-branch (no retarget)
 
         fps = context.scene.render.fps
         imported_count = 0
@@ -2593,13 +2601,15 @@ class ACTOR_OT_pick_animation(Operator):
                         context, anim_armature, armature_obj, pa_to_build,
                         bind_pose)
                 else:
-                    # Absolute formula (bind_pose=None): each bone reaches the
-                    # game's parent-local orientation. The bind-branch maps an
-                    # anim that parks a bone at its bind (menu idles) to the
-                    # REST pose (a T-pose), so it's dropped here. On a matched
-                    # or root-corrected rig this reproduces the game pose.
+                    # Normal rigs: bind-branch (bind_pose) — maps the anim onto
+                    # the skin's rest, correct for game skeletons. Root-fixed
+                    # custom rigs: absolute (bind_pose=None) — the rig now IS a
+                    # game skeleton so its parent-local orientations equal the
+                    # game's, and absolute avoids the bind-branch's T-pose on
+                    # bones parked at their bind (menu idles).
                     action = build_action(armature_obj, pa_to_build,
-                                          bind_pose=None,
+                                          bind_pose=(None if use_absolute
+                                                     else bind_pose),
                                           bone_remap=bone_remap,
                                           target_bind_pose=target_bind_pose,
                                           anim_armature=anim_armature,

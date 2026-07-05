@@ -12,9 +12,13 @@
   mesh moves 0.000, body deviation from the game pose 0.000 (XML2), and both
   games render on-model. Falls back to retargeting only if a *skinned* bone
   is also off (can't snap it without deforming the mesh).
-- Native animation import now uses the **absolute** pose formula (the same
-  one MUA uses) instead of the bind-branch, so menu idles no longer import
-  as a T-pose.
+- Animation import now picks the pose formula by rig type: **normal
+  game-imported rigs keep the bind-branch** (correct for them — a skinned
+  bone legitimately differs between the skin's rest and the anim's bind),
+  and only a **root-corrected custom rig uses the absolute formula**. A
+  previous build applied absolute to everything, which collapsed normal
+  MUA/XML2 rigs (e.g. Wolverine's crouch idle). Normal rigs are no longer
+  routed through root-fixing or retargeting at all.
 - **Game animations now import correctly onto converted / cross-game rigs.**
   A rig with Bip01 bone names but different rest orientations — a Rig
   Converter output, or an XML1-PS2 skin driven by XML2-PC animations —
