@@ -136,6 +136,10 @@ def _import_anim_via_retarget(context, ref_arm, target_arm, pa, bind_pose):
         f0, f1 = src_action.frame_range
         bone_map = {b.name: b.name for b in ref_arm.data.bones
                     if b.name in target_arm.data.bones}
+        # Anchor the pelvis so a rotated root (Bip01) can't swing the body
+        # off-center; the body below the pelvis matches the game skeleton.
+        anchor = next((n for n in ("Bip01 Pelvis", "Pelvis", "Bip01")
+                       if n in target_arm.data.bones), None)
         # root_motion=False keeps the character grounded at its rest hip
         # height. Baking the reference's hip world-displacement floated the
         # rig up/off-origin (the ref armature imports at a different scale, so
@@ -147,7 +151,7 @@ def _import_anim_via_retarget(context, ref_arm, target_arm, pa, bind_pose):
             ref_arm, target_arm,
             int(f0), int(_math.ceil(f1)),
             action_name=pa.name, root_motion=False, bone_map=bone_map,
-            follow_translation=True, match_absolute=True)
+            follow_translation=True, match_absolute=True, anchor_bone=anchor)
     finally:
         ref_arm.animation_data.action = prev_action
         try:

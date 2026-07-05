@@ -114,7 +114,8 @@ def _depth(bone):
 def retarget_and_bake(src_arm, tgt_arm, frame_start, frame_end,
                       game='xml2', action_name="VR_Take", root_motion=True,
                       step=1, hip_scale=None, bone_map=None,
-                      follow_translation=False, match_absolute=False):
+                      follow_translation=False, match_absolute=False,
+                      anchor_bone=None):
     """Retarget ``src_arm``'s animation onto ``tgt_arm`` and bake a new Action.
 
     Args:
@@ -277,7 +278,22 @@ def retarget_and_bake(src_arm, tgt_arm, frame_start, frame_end,
             parent_pose = (computed[bone.parent.name]
                            if bone.parent else Matrix.Identity(4))
 
-            if name in delta_w3:
+            if anchor_bone is not None and name == anchor_bone \
+                    and name in abs_w3:
+                # ANCHOR: pin this bone (the pelvis) at its own REST position
+                # in armature space and orient it to the source's absolute
+                # world orientation. This ignores the pose of the bones ABOVE
+                # it — critical when the rig's root chain (Bip01) is rotated
+                # off the game skeleton: FK-ing the pelvis through a 90°-turned
+                # root swings the whole body off to the side. Anchoring keeps
+                # the character planted while the body below still matches the
+                # game pose (the rig's pelvis-and-below rests match the game).
+                desired_arm3 = tgt_mw3_inv @ abs_w3[name]
+                head = bone.matrix_local.translation.copy()
+                if name in trans_delta_w:
+                    head = head + tgt_mw3_inv @ (trans_delta_w[name] * scale)
+                pose_arm = Matrix.Translation(head) @ desired_arm3.to_4x4()
+            elif name in delta_w3:
                 # Desired armature-space rotation for this bone.
                 # match_absolute: make the target bone reach the SOURCE bone's
                 # absolute world orientation (game anims are absolute poses, so
@@ -310,7 +326,8 @@ def retarget_and_bake(src_arm, tgt_arm, frame_start, frame_end,
                     pb.keyframe_insert("rotation_quaternion", frame=f,
                                        group=name)
                     if ((name == pelvis_name and root_motion)
-                            or name in trans_delta_w):
+                            or name in trans_delta_w
+                            or name == anchor_bone):
                         pb.keyframe_insert("location", frame=f, group=name)
 
     scene.frame_set(saved_frame)

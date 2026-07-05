@@ -29,6 +29,13 @@
   baking its hip world-displacement mis-scaled the character up and off
   origin. The retarget now keeps the rig grounded at its rest hip height;
   per-bone translation (correct hip width) is preserved.
+- Retargeted anims no longer sit **off-center / to one side**. The retarget
+  rotated the rig's root chain to the game orientation, but on a rig whose
+  Bip01 is turned ~90° that swings the whole body sideways off origin. The
+  pelvis is now anchored at its rest position and the pose is built down
+  from there (the body below the pelvis matches the game skeleton), so the
+  character stays planted. Verified 0.0-unit pelvis drift, 0.000 body
+  deviation from the game pose.
 - **Animation export FIXED** — exported moveset .igb files were corrupt
   (every Enbaya blob's memory layout shifted; ~180° rotation errors on
   re-import). Three root causes fixed: shared memory-directory entries are
