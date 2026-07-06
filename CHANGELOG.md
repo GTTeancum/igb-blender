@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.6.1 — 2026-07-06
+
+Hotfix release: import/texture correctness + a large animation-import overhaul.
 - **Fixed skins importing PINK on the first import** (textures only appeared
   after deleting and re-importing). Writing the decoded texture to the disk
   cache called `save()` on the working image, which turned it into a FILE
