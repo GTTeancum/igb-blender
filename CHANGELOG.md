@@ -1,6 +1,11 @@
 # Changelog
 
 ## Unreleased
+- **Shininess now round-trips exactly.** The v4 exporter used to floor any
+  shininess below 0.5 to 1.28, silently changing native skins (which ship
+  shininess **0.0**) and breaking round-trip fidelity. It now preserves the
+  material's real value — including 0.0 — matching the v6/v8 builders, so
+  whatever you set in the IGB Materials panel is what reaches the game.
 - The shininess preset buttons (**Soft (native)**, Less Shiny, and the
   per-material Soft/Medium/Tight) now update the IGB Material node group's
   Shininess socket too, not just the `igb_shininess` property — so the

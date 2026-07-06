@@ -294,7 +294,7 @@ def _default_material():
         'ambient': (0.588, 0.588, 0.588, 1.0),
         'specular': (0.0, 0.0, 0.0, 0.0),
         'emission': (0.0, 0.0, 0.0, 0.0),
-        'shininess': 12.8,
+        'shininess': 0.0,   # native default (specular is black here anyway)
         'flags': 0,
     }
 
@@ -305,7 +305,7 @@ def _default_outline_material():
         'ambient': (0.0, 0.0, 0.0, 1.0),
         'specular': (0.0, 0.0, 0.0, 0.0),
         'emission': (0.0, 0.0, 0.0, 0.0),
-        'shininess': 1.28,
+        'shininess': 0.0,
         'flags': 0,
     }
 
@@ -721,19 +721,17 @@ class SkinBuilderV4:
         return attrs
 
     def _build_material(self, mat):
-        # Shininess is the specular EXPONENT. 0 means (R·V)^0 = 1 everywhere, so
-        # the specular map is applied at FULL strength across the whole surface —
-        # the "VERY shiny in advanced lighting" look. Converted materials arrive
-        # with shininess 0 (the extract default), which the get()-fallback below
-        # never overrides, so floor any near-zero value to the native 1.28.
-        _sh = float(mat.get('shininess', 1.28) or 0.0)
-        if _sh < 0.5:
-            _sh = 1.28
+        # Shininess is the specular EXPONENT and is preserved EXACTLY as the
+        # material carries it (matching the v6/v8/general builders). Native
+        # skins ship 0.0 — (R·V)^0 = 1, i.e. the specular map applied at full
+        # strength everywhere — so 0.0 is a real, intended value, not "empty".
+        # The user controls it via the IGB Materials panel / shader; we no
+        # longer floor near-zero values to 1.28 (that silently changed the
+        # imported look and broke round-trip fidelity).
+        _sh = float(mat.get('shininess', 0.0) or 0.0)
         return self._add_obj(MO_MATERIAL, [
             # base Short lives at slot 3 on v4 (vs 2 on v6/v8); native v4 = 1.
             (3, int(mat.get('priority', 1)), 'Short', 2),
-            # Native MUA skins use shininess 1.28 (decoded from 0104); 12.8 was
-            # 10x too sharp for the ASP gloss/rim highlight exponent.
             (4, _sh, 'Float', 4),
             (5, tuple(mat.get('diffuse', (1.0, 1.0, 1.0, 1.0))), 'Vec4f', 16),
             (6, tuple(mat.get('ambient', (0.588, 0.588, 0.588, 1.0))), 'Vec4f', 16),
