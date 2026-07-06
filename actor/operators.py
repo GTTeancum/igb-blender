@@ -362,18 +362,26 @@ class ACTOR_OT_import_actor(Operator, ImportHelper):
         props = context.scene.igb_actor
         anim_filepath = self.filepath
 
+        # The game root for skin/herostat resolution must come from the actor's
+        # OWN location — skins live next to the actor. A stored props.game_dir
+        # left over from a previous import (e.g. the MUA1 PS2 folder) would
+        # otherwise pull PS2 skins/textures when importing a PC actor, so the
+        # PC normal/spec/gloss maps never load. Prefer the path-derived root;
+        # fall back to the stored one only when the actor isn't under actors/.
+        detected_dir = _game_dir_from_actor_path(anim_filepath)
+        use_game_dir = detected_dir or props.game_dir
+
         # Auto-detect game from the skin's own metadata (ignores a stale Game
-        # dropdown — fixes blue/BGR MUA PC textures) and fill the game dir.
+        # dropdown — fixes blue/BGR MUA PC textures) and sync the game dir.
         if props.auto_detect_game:
             game_preset = 'auto'
-            detected_dir = _game_dir_from_actor_path(anim_filepath)
-            if detected_dir and not props.game_dir:
+            if detected_dir:
                 props.game_dir = detected_dir
         else:
             game_preset = props.game_preset
 
-        # Try to resolve skin files
-        skin_filepaths = _discover_skin_files(anim_filepath, props.game_dir)
+        # Try to resolve skin files (from the actor's own game root)
+        skin_filepaths = _discover_skin_files(anim_filepath, use_game_dir)
 
         options = {
             'import_skins': props.import_skins,
@@ -394,7 +402,7 @@ class ACTOR_OT_import_actor(Operator, ImportHelper):
         result = import_actor(
             context, anim_filepath,
             skin_filepaths=skin_filepaths if props.import_skins else [],
-            game_dir=props.game_dir if props.game_dir else None,
+            game_dir=use_game_dir if use_game_dir else None,
             operator=self,
             options=options,
         )
@@ -2761,7 +2769,10 @@ class ACTOR_OT_select_skins(Operator):
         # Clear the import_skins option if no skins selected
         # but always pass the list (even empty) to import_actor
         props = context.scene.igb_actor
-        game_dir = props.game_dir if props.game_dir else None
+        # Prefer the actor's own game root (skins live next to it) over a stale
+        # cached game_dir, matching ACTOR_OT_import_actor.
+        game_dir = (_game_dir_from_actor_path(anim_filepath)
+                    or (props.game_dir if props.game_dir else None))
 
         result = import_actor(
             context, anim_filepath,

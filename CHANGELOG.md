@@ -1,6 +1,14 @@
 # Changelog
 
 ## Unreleased
+- **Fixed MUA PC skins importing without normal/spec/gloss maps** when a
+  different game folder had been used earlier in the session. The importer
+  cached the first game root and only updated it while empty, so after
+  browsing the MUA1 PS2 folder, importing a PC actor still resolved skins
+  from the stale PS2 root — and the PS2 skin has no normal maps. Skin and
+  herostat resolution now always uses the actor's own game root (the skin
+  files live next to the actor), so a PC import pulls the PC skin with its
+  full normal/specular/gloss maps.
 - **Fixed mangled imports when a character's skin and moveset files carry
   different skeletons** (MUA1 PS2: e.g. Storm's skin `0401.igb` has the full
   43-bone `Unnamed bone` skeleton, but her moveset `04_storm.igb` ships a
