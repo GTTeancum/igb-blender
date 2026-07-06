@@ -1,6 +1,13 @@
 # Changelog
 
 ## Unreleased
+- **Fixed skins importing PINK on the first import** (textures only appeared
+  after deleting and re-importing). Writing the decoded texture to the disk
+  cache called `save()` on the working image, which turned it into a FILE
+  source and then blanked its path — leaving it unhooked (pink). It only
+  looked right the second time because that hit the disk-cache *load* path.
+  The cache is now written through a throwaway copy, so the imported image
+  stays packed and displays correctly on the very first import.
 - **Fixed MUA PC skins importing without normal/spec/gloss maps** when a
   different game folder had been used earlier in the session. The importer
   cached the first game root and only updated it while empty, so after

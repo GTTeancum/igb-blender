@@ -1133,20 +1133,32 @@ def _get_or_create_blender_image(parsed_image, profile=None, is_normal_map=False
             float_pixels[dst_idx + 3] = rgba_data[src_idx + 3] / 255.0  # A
 
     bl_image.pixels.foreach_set(float_pixels)
+    bl_image.update()
 
-    # Save the decoded RGBA to the disk cache for instant future imports
+    # Pack the freshly-decoded pixels into the .blend. The image stays a
+    # GENERATED source and is fully self-contained.
+    bl_image.pack()
+
+    # Save the decoded RGBA to the disk cache for instant future imports. Do it
+    # through a THROWAWAY COPY — calling save() on bl_image itself turned it
+    # into a FILE source, and blanking the path then left it broken (PINK on
+    # the first import; it only looked right on the second import because that
+    # took the disk-cache LOAD path). The working image is never touched.
     if disk_cache_path is not None:
+        _tmp = None
         try:
-            bl_image.filepath_raw = disk_cache_path
-            bl_image.file_format = 'PNG'
-            bl_image.save()
+            _tmp = bl_image.copy()
+            _tmp.filepath_raw = disk_cache_path
+            _tmp.file_format = 'PNG'
+            _tmp.save()
         except Exception:
             pass
         finally:
-            bl_image.filepath_raw = ""
-
-    # Pack into blend file so it's not lost
-    bl_image.pack()
+            if _tmp is not None:
+                try:
+                    bpy.data.images.remove(_tmp)
+                except Exception:
+                    pass
 
     # Cache it
     if cache_key is not None:
