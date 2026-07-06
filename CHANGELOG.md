@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+- The shininess preset buttons (**Soft (native)**, Less Shiny, and the
+  per-material Soft/Medium/Tight) now update the IGB Material node group's
+  Shininess socket too, not just the `igb_shininess` property — so the
+  shading tab / viewport actually reflects the change instead of staying
+  on the old value.
+
 ## 0.6.1 — 2026-07-06
 
 Hotfix release: import/texture correctness + a large animation-import overhaul.

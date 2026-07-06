@@ -1129,6 +1129,26 @@ class IGB_OT_set_all_emission(Operator):
         return {'FINISHED'}
 
 
+def _apply_shininess(mat, value):
+    """Set shininess on both the custom property AND the IGB Material node
+    group's Shininess socket.
+
+    The custom property (``igb_shininess``) is what EXPORT reads; the node
+    group's Shininess socket is what the viewport SHADER reads. They are
+    independent values, so updating only the property (the old behaviour)
+    changed the panel number but left the shading tab untouched.
+    """
+    v = float(value)
+    mat["igb_shininess"] = v
+    try:
+        from .utils.material_nodes import find_igb_node, set_igb_node_values
+        node = find_igb_node(mat)
+        if node is not None:
+            set_igb_node_values(node, {'shininess': v})
+    except Exception:
+        pass
+
+
 class IGB_OT_set_all_shininess(Operator):
     """Set igMaterialAttr shininess on all IGB materials.\n"""  \
     """Shininess (specular exponent) controls the size of specular highlights.\n"""  \
@@ -1153,7 +1173,7 @@ class IGB_OT_set_all_shininess(Operator):
             self.report({'WARNING'}, "No IGB materials found")
             return {'FINISHED'}
         for mat in mats:
-            mat["igb_shininess"] = self.shininess
+            _apply_shininess(mat, self.shininess)
         scope = ("skin" if self.skins_only
                  else "selected" if self.selected_only else "all")
         self.report({'INFO'},
@@ -2500,7 +2520,7 @@ class IGB_OT_set_shininess(Operator):
         if mat is None:
             self.report({'ERROR'}, "No material")
             return {'CANCELLED'}
-        mat["igb_shininess"] = float(self.value)
+        _apply_shininess(mat, self.value)
         return {'FINISHED'}
 
 
