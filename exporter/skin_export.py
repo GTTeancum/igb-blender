@@ -1205,6 +1205,17 @@ def _get_texture(mesh_obj, swap_rb=False, mat_slot=0, max_texture_size=0,
         levels, pfmt = cached
         return (levels, pfmt) if return_pfmt else levels
 
+    # Byte-identical reuse: an unedited native texture emits its ORIGINAL DXT
+    # blocks instead of a lossy decode->re-encode pass. Skipped when resizing
+    # (a size cap necessarily re-encodes).
+    if int(max_texture_size) == 0:
+        from ..utils.texture_preserve import recall_original
+        recalled = recall_original(bl_image)
+        if recalled is not None:
+            levels, pfmt = recalled
+            _TEX_COMPRESS_CACHE[ck] = (levels, pfmt)
+            return (levels, pfmt) if return_pfmt else levels
+
     rgba, w, h = _extract_image_rgba(bl_image, w, h, max_texture_size=max_texture_size)
 
     if dxt1 and rgba_is_opaque(rgba):
@@ -1441,6 +1452,17 @@ def _get_texture_role(mesh_obj, role, swap_rb=False, mat_slot=0,
         if levels is None:      # cached "skip" (e.g. non-normal on Normal input)
             return None
         return (levels, pfmt) if return_pfmt else levels
+
+    # Byte-identical reuse of an unedited native map (normal/spec/gloss). The
+    # stored blocks are already in native encoding (DXT5nm for normals, the
+    # green flip and R/B swap were baked in at import), so emit them verbatim.
+    if int(max_texture_size) == 0:
+        from ..utils.texture_preserve import recall_original
+        recalled = recall_original(bl_image)
+        if recalled is not None:
+            levels, pfmt = recalled
+            _TEX_COMPRESS_CACHE[ck] = (levels, pfmt)
+            return (levels, pfmt) if return_pfmt else levels
 
     rgba, w, h = _extract_image_rgba(bl_image, w, h,
                                      max_texture_size=max_texture_size)

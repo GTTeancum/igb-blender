@@ -1,6 +1,27 @@
 # Changelog
 
 ## Unreleased
+
+## 0.6.2 — 2026-07-07
+
+Fidelity release: exported textures now ship **byte-identical** to native when
+you haven't edited them, plus the shininess fixes.
+- **Original texture blocks are reused on export when a texture is unedited.**
+  The exporter used to always decode every texture to RGBA and re-compress it
+  as DXT — a second lossy pass on top of the game's original DXT that subtly
+  shifted a skin's colour/tone in-game (most visible on specular-heavy suits,
+  because native shininess 0.0 applies the specular map across the whole
+  surface). Now, on import, each texture's original encoded mip chain is
+  stashed and fingerprinted; on export, if the pixels are unchanged, the
+  **exact original DXT blocks** are written back — diffuse, normal, specular
+  and gloss, every mip level, byte-for-byte. Edit a texture and it re-encodes
+  as before (the fingerprint changes), so nothing is stale. A size cap
+  (Max Texture Size) or a format change still re-encodes.
+- **Removed an orphaned lighting-state object** the v4 exporter emitted on
+  skins with no toon outline. It was unreferenced (the engine never saw it) so
+  it changed nothing in-game, but it was dead weight and made export-vs-native
+  diffs noisier. The lighting-OFF state is now created only when an outline set
+  actually needs it — matching native actors, which carry no such attribute.
 - **Shininess now round-trips exactly.** The v4 exporter used to floor any
   shininess below 0.5 to 1.28, silently changing native skins (which ship
   shininess **0.0**) and breaking round-trip fidelity. It now preserves the

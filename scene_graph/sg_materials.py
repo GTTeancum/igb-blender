@@ -193,7 +193,7 @@ class ParsedImage:
         'bits_red', 'bits_green', 'bits_blue', 'bits_alpha',
         'pixel_data', 'name', 'source_obj',
         'clut_data', 'clut_num_entries', 'clut_bpp',
-        'cache_key',
+        'cache_key', 'orig_levels', 'orig_pfmt',
     )
 
     def __init__(self):
@@ -215,6 +215,9 @@ class ParsedImage:
         self.clut_num_entries = 0   # 16 for 4bpp, 256 for 8bpp
         self.clut_bpp = 0           # 4 or 8 (index bit depth)
         self.cache_key = None       # unique key for caching (e.g. file path for IGZ)
+        # Original encoded mip chain for byte-identical re-export (level 0 first)
+        self.orig_levels = None     # list of (encoded_bytes, w, h) or None
+        self.orig_pfmt = None       # original igImage pixel format
 
     @property
     def base_name(self):
@@ -322,6 +325,7 @@ def extract_texture_bind(reader, texbind_obj, profile=None):
     # Extract texture properties (igTextureAttr is igAttr-derived: slots 4+ are fixed)
     image_ref = None
     texdata_ref = None  # slot 19: _data (igUnsignedCharList, Wii pixel data)
+    miplist_candidates = []  # ObjectRefs that may be the igImageMipMapList
     for slot, val, fi in texture_attr._raw_fields:
         if slot == 5 and fi.short_name == b"Enum":
             tex.mag_filter = val
@@ -335,6 +339,8 @@ def extract_texture_bind(reader, texbind_obj, profile=None):
             image_ref = val
         elif slot == 19 and fi.short_name == b"ObjectRef" and val != -1:
             texdata_ref = val
+        elif fi.short_name == b"ObjectRef" and val != -1 and slot not in (12, 19):
+            miplist_candidates.append(val)
 
     if image_ref is None:
         return tex
@@ -359,6 +365,33 @@ def extract_texture_bind(reader, texbind_obj, profile=None):
                         if isinstance(mem_block, IGBMemoryBlock) and mem_block.data:
                             tex.image.pixel_data = bytes(mem_block.data)
                         break
+
+        # Capture the ORIGINAL encoded mip chain so an unedited re-export can
+        # reuse the exact DXT blocks instead of re-compressing (byte-identical
+        # textures, no lossy decode->re-encode pass). Level 0 = the base image;
+        # levels 1..N come from the igImageMipMapList. Best-effort: any failure
+        # just leaves orig_levels None and the exporter re-compresses as before.
+        if tex.image is not None and tex.image.pixel_data:
+            try:
+                levels = [(tex.image.pixel_data,
+                           tex.image.width, tex.image.height)]
+                mip_list = None
+                for cand in miplist_candidates:
+                    obj = reader.resolve_ref(cand)
+                    if isinstance(obj, IGBObject) and obj.is_type(b"igImageMipMapList"):
+                        mip_list = obj
+                        break
+                if mip_list is not None:
+                    for mip_obj in reader.resolve_object_list(mip_list):
+                        if (isinstance(mip_obj, IGBObject)
+                                and mip_obj.is_type(b"igImage")):
+                            mp = extract_image(reader, mip_obj)
+                            if mp is not None and mp.pixel_data:
+                                levels.append((mp.pixel_data, mp.width, mp.height))
+                tex.image.orig_levels = levels
+                tex.image.orig_pfmt = tex.image.pixel_format
+            except Exception:
+                pass
 
     return tex
 

@@ -405,8 +405,12 @@ class SkinBuilderV4:
         # ---- shared attrs ----
         cull_idx = self._add_obj(MO_CULL_FACE, [
             (3, 1, 'Short', 2), (4, 1, 'Bool', 1), (5, 0, 'Enum', 4)])
-        light_idx = self._add_obj(MO_LIGHTING_STATE, [
-            (3, 1, 'Short', 2), (4, 0, 'Bool', 1)])
+        # Lighting-OFF state is attached ONLY to toon-outline sets; a normal
+        # textured mesh never references it (native actors carry no such attr,
+        # so the engine lights them by default). Create it lazily via
+        # _get_light_state() so a skin with no outline emits no orphan attr —
+        # an orphaned lighting-off object was a red herring in export diffs.
+        self._light_state_idx = None
         # 0103 carries two igTextureStateAttr: texturing ON for textured
         # sets, OFF for outline sets
         texstate_on_idx = self._add_obj(MO_TEX_STATE, [
@@ -449,7 +453,7 @@ class SkinBuilderV4:
                 unit_name = (f'{skin_name}_outline' if is_outline
                              else skin_name)
             unit = self._build_unit(mesh, mat, chain, is_outline,
-                                    palette_idx, cull_idx, light_idx,
+                                    palette_idx, cull_idx,
                                     texstate_on_idx, texstate_off_idx,
                                     vbs_idx, unit_name)
             if segment_name:
@@ -843,8 +847,15 @@ class SkinBuilderV4:
                 (3, 1, 'Short', 2), (4, 1, 'Bool', 1), (5, int(unit), 'Int', 4)])
         return cache[unit]
 
+    def _get_light_state(self):
+        """Lazily create the shared lighting-OFF state (outline sets only)."""
+        if self._light_state_idx is None:
+            self._light_state_idx = self._add_obj(MO_LIGHTING_STATE, [
+                (3, 1, 'Short', 2), (4, 0, 'Bool', 1)])
+        return self._light_state_idx
+
     def _build_unit(self, mesh, material, tex_bind_idx, is_outline,
-                    palette_idx, cull_idx, light_idx, texstate_on_idx,
+                    palette_idx, cull_idx, texstate_on_idx,
                     texstate_off_idx, vbs_idx, unit_name):
         """group -> BMS -> AttrSet -> Geometry chain for one submesh.
 
@@ -951,7 +962,7 @@ class SkinBuilderV4:
             head = [mat_cull_idx] if mat_cull_idx is not None else []
             attrs = head + [color_idx, mat_idx] + extra + tex_pairs
         else:
-            attrs = ([cull_idx, light_idx, color_idx, mat_idx] + extra
+            attrs = ([cull_idx, self._get_light_state(), color_idx, mat_idx] + extra
                      + [texstate_off_idx])
         set_al = self._ref_list(MO_ATTR_LIST, attrs)
         set_nl = self._ref_list(MO_NODE_LIST, [geom_idx])

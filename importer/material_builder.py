@@ -1086,6 +1086,7 @@ def _get_or_create_blender_image(parsed_image, profile=None, is_normal_map=False
             bl_image.filepath_raw = ""
             if cache_key is not None:
                 _image_cache[cache_key] = bl_image.name
+            _remember_original_texture(bl_image, parsed_image)
             return bl_image
         except Exception:
             pass  # corrupt cache entry — fall through to a fresh decode
@@ -1164,7 +1165,21 @@ def _get_or_create_blender_image(parsed_image, profile=None, is_normal_map=False
     if cache_key is not None:
         _image_cache[cache_key] = bl_image.name
 
+    _remember_original_texture(bl_image, parsed_image)
     return bl_image
+
+
+def _remember_original_texture(bl_image, parsed_image):
+    """Stash the source igImage's encoded mip levels so an unedited re-export
+    reuses the exact DXT blocks (byte-identical) instead of re-compressing."""
+    try:
+        levels = getattr(parsed_image, 'orig_levels', None)
+        pfmt = getattr(parsed_image, 'orig_pfmt', None)
+        if levels and pfmt is not None:
+            from ..utils.texture_preserve import remember_original
+            remember_original(bl_image, levels, pfmt)
+    except Exception:
+        pass
 
 
 _TEX_CACHE_VERSION = "1"
