@@ -1,3 +1,7 @@
+> **Separate Windows app:** [Alchemy Batch Converter](tools/alchemy_batch/README.md)
+> provides folder scanning and batch conversion using this add-on's backend.
+> Download its `batch-converter-v0.1.0` release from the GTTeancum fork.
+
 # IGB Blender Addon
 
 **Version 0.6.0** — see [CHANGELOG.md](CHANGELOG.md) for what's new.

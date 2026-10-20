@@ -11,3 +11,6 @@ Thumbs.db
 
 # Bundled dependencies (too large for git)
 mapmaker/deps/
+
+# Batch app build, runtime cache, logs and private conversion tests
+/.local/
