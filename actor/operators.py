@@ -830,17 +830,21 @@ class ACTOR_OT_export_skin(Operator, ExportHelper):
         name="Platform",
         description="Target platform. PC uses each game's native PC format; "
                     "PS2 / GameCube force the v6 console format these games "
-                    "use (CLUT on PS2, GX-tiled CMPR on GameCube)",
+                    "use (CLUT on PS2, GX-tiled CMPR on GameCube). "
+                    "Wii uses v6 with tiled RGB5A3 diffuse textures",
         items=[
             ('PC', "PC", "Native PC format for the selected game"),
             ('PS2', "PS2 (XML1/XML2/MUA1)",
              "v6 skin + CLUT (PSMT8) textures — the format these games load on "
              "PlayStation 2. Use this even for MUA1: PS2 MUA1 is v6, not the "
              "PC v4 + DXT5"),
-        ('GC', "GameCube (XML1/XML2)",
+            ('GC', "GameCube (XML1/XML2)",
              "v6 skin + CMPR (GX-tiled DXT1) textures — the format X-Men "
-             "Legends 1 & 2 load on GameCube. (MUA on Nintendo is Wii/v8, not "
-             "covered by this preset)"),
+             "Legends 1 & 2 load on GameCube"),
+            ('WII', "Wii (MUA2)",
+             "v6 skin + tiled RGB5A3 diffuse textures. Tested with MUA2 in "
+             "OpenMUA2; other Wii games and original hardware are unverified. "
+             "256px textures recommended; no normal/specular/gloss maps"),
         ],
         default='PC',
     )
@@ -983,8 +987,12 @@ class ACTOR_OT_export_skin(Operator, ExportHelper):
                       icon='SCENE')
             fmt.label(text="X-Men Legends 1 & 2 load this on GameCube.",
                       icon='INFO')
-            fmt.label(text="MUA on Nintendo is Wii/v8 (not this preset).",
+        elif self.platform == 'WII':
+            fmt.label(text="Wii: v6 + tiled RGB5A3 textures", icon='SCENE')
+            fmt.label(text="Diffuse only; no mipmaps.", icon='INFO')
+            fmt.label(text="256px recommended (tested with OpenMUA2).",
                       icon='INFO')
+            fmt.label(text="Other Wii games/hardware not verified.", icon='INFO')
         elif self.game_target == 'MUA':
             fmt.label(text="MUA (PC): v4 + DXT5 textures", icon='CHECKMARK')
             mp = layout.box().column(align=True)
@@ -1104,6 +1112,16 @@ class ACTOR_OT_export_skin(Operator, ExportHelper):
 
         use_mips = True
         normal_map_size = 0
+
+        if self.platform == 'WII' and not self.mannequin_mode:
+            # Compatible v6 skin graph with the Wii image layout tested in
+            # OpenMUA2. Keep this separate from GameCube's CMPR encoding.
+            igb_format = 'V6'
+            graph_mode = 'OFF'
+            texture_mode = 'wii_rgb5a3'
+            swap_rb = False
+            use_nm = use_spec = use_gloss = False
+            use_mips = False
 
         try:
             max_texture_size = int(self.texture_resolution)

@@ -55,6 +55,7 @@ The standalone Conversation Editor window requires PySide6. You can install it f
 | Marvel Ultimate Alliance | PC | IGB | IGB |
 | Marvel Ultimate Alliance | PS2, PSP, Xbox | IGB | - |
 | Marvel Ultimate Alliance 2 | PS2, PSP | IGB | - |
+| Marvel Ultimate Alliance 2 | Wii | - | Skin IGB (tested in OpenMUA2) |
 | Marvel Ultimate Alliance 2 | PC | IGZ (Broken) | - |
 
 > **IGZ Note:** Mesh geometry mostly imports but textures are not working yet.
@@ -179,6 +180,35 @@ Manages the skin mesh variants attached to an actor.
 - **Solo Selected** - Hides all skins except the selected one.
 - **Import / Export Skin** - Load or save individual skin IGB files.
 - **Add / Remove** - Attach a Blender mesh as a new skin or remove one.
+
+##### Wii skin export (MUA2)
+
+In **IGB Actor > Skins > Export Skin**, select **Platform: Wii (MUA2)**.
+The preset overrides the game-specific PC format and exports a complete v6
+skinned graph with **tiled RGB5A3 diffuse textures** (Wii image format 21,
+image order 103). It disables normal/specular/gloss maps, mipmaps and the PC
+red/blue swap. This is separate from the GameCube CMPR preset.
+
+Choose **Texture Resolution: 256 (Smallest)** to use the tested size. The existing
+resolution control still allows larger textures; those need their own in-game
+memory/appearance checks. Encoded textures must have positive dimensions divisible
+by four. This addition does not implement Wii texture import or scene export.
+
+Validation used four MUA1 PC Luke Cage costumes in **OpenMUA2**, including repeated
+costume cycling and loading the third costume into a level. The registered Blender
+export operator reproduced those tested models byte-for-byte. Other Wii games,
+original hardware, and exhaustive animation coverage have not been verified.
+No game assets are included.
+
+Asset-free regression checks:
+
+```text
+python -m unittest discover -s tests -v
+blender --background --factory-startup --python-exit-code 1 --python tests/blender_skin_presets.py
+```
+
+The Blender check exercises the registered export operator with a mocked builder
+boundary; it verifies preset routing, not rendered game output.
 
 #### Segments
 

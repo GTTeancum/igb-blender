@@ -99,7 +99,7 @@ def export_skin(filepath, mesh_objs, armature_obj, operator=None, swap_rb=False,
         armature_obj: Blender armature object (with igb_* custom properties).
         operator: Blender operator for reporting.
         swap_rb: If True, swap R/B channels in DXT for MUA PC BGR565 encoding.
-        texture_mode: 'dxt5' for DXT5 compressed, 'clut' for 256-color palette (universal).
+        texture_mode: 'dxt5', 'clut', 'cmpr', or 'wii_rgb5a3' (Wii tiled diffuse).
         max_texture_size: 0 = keep original size; otherwise cap longest edge to this value.
         actor_graph: 'OFF' / 'ANIM' / 'FULL' — how much of the Max-style
             actor/animation graph to emit.
@@ -363,6 +363,12 @@ def export_skin(filepath, mesh_objs, armature_obj, operator=None, swap_rb=False,
                     max_texture_size=max_texture_size)
                 sub_dict['clut_data'] = clut_result
                 sub_dict['texture_levels'] = None
+            elif texture_mode == 'wii_rgb5a3':
+                sub_dict['rgb5a3_levels'] = _get_texture_rgb5a3(
+                    mesh_obj, mat_slot=mat_slot,
+                    max_texture_size=max_texture_size)
+                sub_dict['clut_data'] = None
+                sub_dict['texture_levels'] = None
             elif texture_mode == 'cmpr':
                 # GameCube/Wii CMPR (GX-tiled DXT1). v6 geometry, pfmt 34.
                 sub_dict['cmpr_levels'] = _get_texture_cmpr(
@@ -453,7 +459,8 @@ def export_skin(filepath, mesh_objs, armature_obj, operator=None, swap_rb=False,
             # Honor the Mipmaps toggle by trimming every map to its base level.
             if not use_mipmaps:
                 for _k in ('texture_levels', 'normal_levels',
-                           'specular_levels', 'gloss_levels', 'cmpr_levels'):
+                           'specular_levels', 'gloss_levels', 'cmpr_levels',
+                           'rgb5a3_levels'):
                     lv = sub_dict.get(_k)
                     if lv:
                         sub_dict[_k] = lv[:1]
@@ -1558,6 +1565,28 @@ def _get_texture_cmpr(mesh_obj, mat_slot=0, max_texture_size=0):
         return None
     rgba, w, h = _extract_image_rgba(bl_image, w, h, max_texture_size=max_texture_size)
     return [(compress_rgba_to_cmpr(bytes(rgba), w, h), w, h)]
+
+
+def _get_texture_rgb5a3(mesh_obj, mat_slot=0, max_texture_size=0):
+    """Export the diffuse image in Wii tiled RGB5A3, one base level."""
+    from ..utils.wii_rgb5a3 import encode_rgb5a3
+
+    if not mesh_obj.data.materials or mat_slot >= len(mesh_obj.data.materials):
+        return None
+    mat = mesh_obj.data.materials[mat_slot]
+    if mat is None or not mat.use_nodes or not mat.node_tree:
+        return None
+
+    # Diffuse image (group Base Texture / BSDF Base Color; never a role map).
+    bl_image = _find_diffuse_image(mat)
+    if bl_image is None:
+        return None
+
+    w, h = bl_image.size[0], bl_image.size[1]
+    if w == 0 or h == 0:
+        return None
+    rgba, w, h = _extract_image_rgba(bl_image, w, h, max_texture_size=max_texture_size)
+    return [(encode_rgb5a3(bytes(rgba), w, h), w, h)]
 
 
 def _extract_image_rgba(bl_image, w, h, max_texture_size=0):

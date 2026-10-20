@@ -680,7 +680,7 @@ class SkinBuilder:
 
             # Skip submeshes with NO texture data — they'll use fallback
             has_tex_data = bool(sub.get('clut_data') or sub.get('texture_levels')
-                                or sub.get('cmpr_levels'))
+                                or sub.get('cmpr_levels') or sub.get('rgb5a3_levels'))
             if not tex_key and not has_tex_data:
                 continue
 
@@ -689,6 +689,10 @@ class SkinBuilder:
                 palette_data, index_data, cw, ch = sub['clut_data']
                 _, tex_bind_idx = self._build_clut_texture_chain(
                     palette_data, index_data, cw, ch, tex_key
+                )
+            elif sub.get('rgb5a3_levels'):
+                _, tex_bind_idx = self._build_rgb5a3_texture_chain(
+                    sub.get('rgb5a3_levels'), tex_key
                 )
             elif sub.get('cmpr_levels'):
                 _, tex_bind_idx = self._build_cmpr_texture_chain(
@@ -1390,6 +1394,85 @@ class SkinBuilder:
             mipmap_list_idx = -1
 
         num_levels = len(cmpr_levels)
+        texture_attr_idx = self._add_obj(MO_TEXTURE_ATTR, [
+            (2, 0, 'Short', 2),
+            (4, 0, 'UnsignedInt', 4),
+            (5, 1, 'Enum', 4),
+            (6, 3, 'Enum', 4),
+            (7, 1, 'Enum', 4),
+            (8, 1, 'Enum', 4),
+            (10, 0, 'Enum', 4),
+            (11, 0, 'Enum', 4),
+            (12, base_img_idx if base_img_idx is not None else -1, 'ObjectRef', 4),
+            (13, 0, 'Bool', 1),
+            (14, -1, 'ObjectRef', 4),
+            (15, num_levels, 'Int', 4),
+            (16, mipmap_list_idx, 'ObjectRef', 4),
+        ])
+
+        texture_bind_idx = self._add_obj(MO_TEXTURE_BIND_ATTR, [
+            (2, 0, 'Short', 2),
+            (4, texture_attr_idx, 'ObjectRef', 4),
+            (5, 0, 'Int', 4),
+        ])
+
+        return texture_attr_idx, texture_bind_idx
+
+    def _build_rgb5a3_texture_chain(self, rgb5a3_levels, tex_name):
+        """Build Wii RGB5A3 images (pfmt 21, order 103, tiled 4x4)."""
+        if rgb5a3_levels is None:
+            rgb5a3_levels = []
+
+        base_img_idx = None
+        mip_img_indices = []
+
+        for level_idx, (comp_data, tw, th) in enumerate(rgb5a3_levels):
+            pixel_mb = self._add_mem(MO_EXTERNAL_INFO_ENTRY, comp_data, align_type=1)
+            img_size = len(comp_data)
+            # RGB5A3 stores two bytes per pixel.
+            stride = tw * 2
+
+            img_idx = self._add_obj(MO_IMAGE, [
+                (2, tw, 'UnsignedInt', 4),
+                (3, th, 'UnsignedInt', 4),
+                (4, 4, 'UnsignedInt', 4),
+                (5, 0, 'UnsignedInt', 4),
+                (6, 103, 'UnsignedInt', 4),       # GameCube tiled image order
+                (7, 5, 'UnsignedInt', 4),
+                (8, 5, 'UnsignedInt', 4),
+                (9, 5, 'UnsignedInt', 4),
+                (10, 1, 'UnsignedInt', 4),
+                (11, 21, 'Enum', 4),              # Wii RGB5A3
+                (12, img_size, 'Int', 4),
+                (13, pixel_mb, 'MemoryRef', 4),
+                (14, -1, 'MemoryRef', 4),
+                (15, 1, 'Bool', 1),
+                (16, 0, 'UnsignedInt', 4),
+                (17, -1, 'ObjectRef', 4),          # no CLUT
+                (18, 0, 'UnsignedInt', 4),
+                (19, stride, 'Int', 4),
+                (20, 1, 'Bool', 1),                # Native Alchemy tiled-image flag
+                (21, 0, 'UnsignedInt', 4),
+                (22, tex_name, 'String', 4),
+            ])
+
+            if level_idx == 0:
+                base_img_idx = img_idx
+            else:
+                mip_img_indices.append(img_idx)
+
+        if mip_img_indices:
+            mip_data = struct.pack("<" + "i" * len(mip_img_indices), *mip_img_indices)
+            mip_mb = self._add_mem(MO_OBJECT, mip_data)
+            mipmap_list_idx = self._add_obj(MO_MIPMAP_LIST, [
+                (2, len(mip_img_indices), 'Int', 4),
+                (3, len(mip_img_indices), 'Int', 4),
+                (4, mip_mb, 'MemoryRef', 4),
+            ])
+        else:
+            mipmap_list_idx = -1
+
+        num_levels = len(rgb5a3_levels)
         texture_attr_idx = self._add_obj(MO_TEXTURE_ATTR, [
             (2, 0, 'Short', 2),
             (4, 0, 'UnsignedInt', 4),
